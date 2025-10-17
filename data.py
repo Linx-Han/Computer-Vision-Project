@@ -21,7 +21,8 @@ class Nutrition5kDataset(Dataset):
         self.is_train = is_train
         
         # 构建基础路径
-        base_path = self.root_dir / 'comp-90086-nutrition-5-k' / 'Nutrition5K' / 'Nutrition5K'
+        # / 'comp-90086-nutrition-5-k' / 'Nutrition5K' / 'Nutrition5K'
+        base_path = self.root_dir 
         
         # RGB和Depth目录
         self.color_dir = base_path / 'train' / 'color'
@@ -203,8 +204,8 @@ class Nutrition5kTestDataset(Dataset):
 # ============= 使用示例 =============
 if __name__ == '__main__':
     # 设置路径
-    ROOT_DIR = '/Users/hanlinxuan/Desktop/Learning/Unimelb/2025 S2/CV/Assignment/Project/content'
-    CSV_FILE = '/Users/hanlinxuan/Desktop/Learning/Unimelb/2025 S2/CV/Assignment/Project/content/comp-90086-nutrition-5-k/Nutrition5K/Nutrition5K/nutrition5k_train.csv'
+    ROOT_DIR = '/Users/apple/Code/Computer-Vision-Project'
+    CSV_FILE = '/Users/apple/Code/Computer-Vision-Project/data/nutrition5k_train.csv'
     
     # 创建数据加载器
     train_loader, val_loader = get_dataloaders(

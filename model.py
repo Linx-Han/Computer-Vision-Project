@@ -146,9 +146,14 @@ def main():
     LEARNING_RATE = 0.001
     VAL_SPLIT = 0.2
     
-    # 路径
-    ROOT_DIR = '/Users/hanlinxuan/Desktop/Learning/Unimelb/2025 S2/CV/Assignment/Project/content'
-    CSV_FILE = '/Users/hanlinxuan/Desktop/Learning/Unimelb/2025 S2/CV/Assignment/Project/content/comp-90086-nutrition-5-k/Nutrition5K/Nutrition5K/nutrition5k_train.csv'
+    # 从环境变量读取路径
+    ROOT_DIR = os.getenv('DATA_ROOT_DIR', './data')
+    CSV_FILE = os.getenv('TRAIN_CSV_FILE', './data/nutrition5k_train.csv')
+    CHECKPOINT_DIR = os.getenv('CHECKPOINT_DIR', './checkpoints')
+    
+    print(f"📁 数据根目录: {ROOT_DIR}")
+    print(f"📄 训练CSV文件: {CSV_FILE}")
+    print(f"💾 检查点目录: {CHECKPOINT_DIR}")
     
     # 设备
     if torch.backends.mps.is_available():
@@ -160,7 +165,7 @@ def main():
         print(f"使用设备: {device}")
         
     # 创建保存目录
-    os.makedirs('checkpoints', exist_ok=True)
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     
     # 数据加载
     print("\n加载数据...")
@@ -185,7 +190,7 @@ def main():
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     
-    # 学习率调度器 - 移除verbose参数
+    # 学习率调度器
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=5
     )
@@ -232,24 +237,26 @@ def main():
         
         # 如果学习率改变了，打印提示
         if new_lr < old_lr:
-            print(f"⚠ 学习率降低: {old_lr:.6f} -> {new_lr:.6f}")
+            print(f"⚡ 学习率降低: {old_lr:.6f} -> {new_lr:.6f}")
         
         # 保存最佳模型
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            checkpoint_path = os.path.join(CHECKPOINT_DIR, 'best_model.pth')
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': val_loss,
                 'val_rmse': val_rmse,
-            }, 'checkpoints/best_model.pth')
+            }, checkpoint_path)
             print(f"✓ 保存最佳模型 (Val Loss: {val_loss:.4f}, RMSE: {val_rmse:.4f})")
         
         print()
     
     # 保存训练历史
-    np.save('checkpoints/training_history.npy', history)
+    history_path = os.path.join(CHECKPOINT_DIR, 'training_history.npy')
+    np.save(history_path, history)
     
     print("\n训练完成！")
     print(f"最佳验证Loss: {best_val_loss:.4f}")
