@@ -17,7 +17,7 @@ def train_autoencoder():
     print("=" * 60)
     
     # 超参数
-    BATCH_SIZE = 16
+    BATCH_SIZE = 32
     EPOCHS = 30
     LEARNING_RATE = 0.001
     EMBEDDING_SIZE = 64

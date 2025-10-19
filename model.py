@@ -7,58 +7,33 @@ from tqdm import tqdm
 import os
 import matplotlib.pyplot as plt
 from data import get_dataloaders
+from autoencoder import ImageEncoder
 
-# ============= 轻量版模型定义 =============
+# ============= 使用预训练Encoder的CNN模型 =============
 class CalorieEstimatorCNN(nn.Module):
-    """双流CNN：分别处理RGB和Depth，然后融合"""
-    def __init__(self):
+    """使用Autoencoder预训练的双流CNN"""
+    def __init__(self, use_pretrained=True, pretrained_path=None):
         super(CalorieEstimatorCNN, self).__init__()
         
-        # RGB流 - 只用3层卷积
-        self.rgb_stream = nn.Sequential(
-            # Conv1
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(2),  # 224 -> 112
-            
-            # Conv2
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),  # 112 -> 56
-            
-            # Conv3
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1))  # 全局平均池化
-        )
+        # RGB流 - 使用预训练的Encoder
+        self.rgb_stream = ImageEncoder(in_channels=3, embedding_size=64)
         
-        # Depth流 - 只用3层卷积
-        self.depth_stream = nn.Sequential(
-            # Conv1
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            
-            # Conv2
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            
-            # Conv3
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1))
-        )
+        # Depth流 - 使用预训练的Encoder
+        self.depth_stream = ImageEncoder(in_channels=1, embedding_size=64)
         
-        # 融合层 + 回归头 - 更简单
+        # 加载预训练权重
+        if use_pretrained and pretrained_path and os.path.exists(pretrained_path):
+            print(f"✓ 加载预训练Encoder: {pretrained_path}")
+            checkpoint = torch.load(pretrained_path, map_location='cpu', weights_only=False)
+            self.rgb_stream.load_state_dict(checkpoint['rgb_encoder'])
+            self.depth_stream.load_state_dict(checkpoint['depth_encoder'])
+            print("✓ 预训练权重加载完成")
+        else:
+            print("⚠️ 从随机初始化开始训练")
+        
+        # 融合层 + 回归头
         self.fusion = nn.Sequential(
-            nn.Linear(256, 128),  # 128 + 128 = 256
+            nn.Linear(128, 128),  # 128 + 128 = 256
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(128, 1)
@@ -66,8 +41,8 @@ class CalorieEstimatorCNN(nn.Module):
     
     def forward(self, rgb, depth):
         # 提取特征
-        rgb_feat = self.rgb_stream(rgb).flatten(1)      # [batch, 128]
-        depth_feat = self.depth_stream(depth).flatten(1) # [batch, 128]
+        rgb_feat = self.rgb_stream(rgb)      # [batch, 128]
+        depth_feat = self.depth_stream(depth) # [batch, 128]
         
         # 融合
         fused = torch.cat([rgb_feat, depth_feat], dim=1) # [batch, 256]
@@ -160,7 +135,7 @@ def plot_training_history(history, save_path='training_results.png'):
                             alpha=0.3, color='gray', label='Gap')
     axes[1, 0].set_xlabel('Epoch', fontsize=12)
     axes[1, 0].set_ylabel('Loss', fontsize=12)
-    axes[1, 0].set_title('Overfitting Check (Train-Val Gap)', fontsize=14, fontweight='bold')
+    axes[1, 0].set_title('Overfitting Check', fontsize=14, fontweight='bold')
     axes[1, 0].legend(fontsize=11)
     axes[1, 0].grid(True, alpha=0.3)
     
@@ -198,19 +173,20 @@ def plot_training_history(history, save_path='training_results.png'):
 
 # ============= 主训练流程 =============
 def main():
-    # 超参数 - 针对小数据集优化
+    print("=" * 60)
+    print("步骤3: 训练CNN (使用预训练的Autoencoder)")
+    print("=" * 60)
+    
+    # 超参数
     BATCH_SIZE = 32
-    EPOCHS = 50
-    LEARNING_RATE = 0.001  
+    EPOCHS = 40
+    LEARNING_RATE = 0.0005  # 使用预训练时降低学习率
     VAL_SPLIT = 0.2
+    USE_PRETRAINED = True  # 是否使用预训练Encoder
     
     # 路径
-    ROOT_DIR = os.getenv('DATA_ROOT_DIR', './data')
-    CSV_FILE = os.getenv('TRAIN_CSV_FILE', './data/nutrition5k_train.csv')
-    CHECKPOINT_DIR = os.getenv('CHECKPOINT_DIR', './checkpoints')
-    print(f"📁 数据根目录: {ROOT_DIR}")
-    print(f"📄 训练CSV文件: {CSV_FILE}")
-    print(f"💾 检查点目录: {CHECKPOINT_DIR}")
+    ROOT_DIR = '/Users/hanlinxuan/Desktop/Learning/Unimelb/2025 S2/CV/Assignment/Project/content'
+    CSV_FILE = '/Users/hanlinxuan/Desktop/Learning/Unimelb/2025 S2/CV/Assignment/Project/content/comp-90086-nutrition-5-k/Nutrition5K/Nutrition5K/nutrition5k_train.csv'
     
     # 设备
     if torch.backends.mps.is_available():
@@ -221,6 +197,7 @@ def main():
         print("⚠️ 使用 CPU")
     
     print(f"设备: {device}")
+    print(f"预训练Encoder: {'启用' if USE_PRETRAINED else '关闭'}")
     
     # 创建保存目录
     os.makedirs('checkpoints', exist_ok=True)
@@ -238,16 +215,19 @@ def main():
     
     # 创建模型
     print("\n创建模型...")
-    model = CalorieEstimatorCNN().to(device)
+    model = CalorieEstimatorCNN(
+        use_pretrained=USE_PRETRAINED,
+        pretrained_path='checkpoints/autoencoder_best.pth'
+    ).to(device)
     
     # 打印模型参数量
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"模型参数量: {total_params:,} (可训练: {trainable_params:,})")
     
-    # 损失函数和优化器
+    # 损失函数和优化器 - 使用AdamW
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
     
     # 学习率调度器
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -337,6 +317,8 @@ def main():
         print(f"  Epoch {i+1}: Train Loss={history['train_loss'][i]:.4f}, "
               f"Val Loss={history['val_loss'][i]:.4f}, "
               f"Val RMSE={history['val_rmse'][i]:.4f}")
+    
+    print("\n下一步: 运行 predict.py 生成提交文件")
 
 
 if __name__ == '__main__':
