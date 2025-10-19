@@ -43,7 +43,7 @@ def predict_test_set(model_path, root_dir, output_file='submission.csv'):
     
     # 创建测试数据集
     print("\n加载测试数据...")
-    test_dataset = Nutrition5kTestDataset(root_dir)
+    test_dataset = Nutrition5kTestDataset(root_dir, use_segmentation=True, unet_path='checkpoints/unet_best.pth')
     test_loader = DataLoader(
         test_dataset,
         batch_size=32,
