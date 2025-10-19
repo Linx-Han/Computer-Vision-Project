@@ -1,343 +1,314 @@
-# model.py
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import numpy as np
-from tqdm import tqdm
+# data.py
 import os
-import matplotlib.pyplot as plt
-from data import get_dataloaders
+import pandas as pd
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image
+from pathlib import Path
+import pickle
+from segmentation import UNet
 
-# ============= 轻量版模型定义 =============
-class CalorieEstimatorCNN(nn.Module):
-    """轻量版双流CNN：适合小数据集"""
-    def __init__(self):
-        super(CalorieEstimatorCNN, self).__init__()
+class Nutrition5kDataset(Dataset):
+    def __init__(self, root_dir, csv_file, is_train=True, use_segmentation=True, unet_path=None):
+        """
+        Args:
+            root_dir: content文件夹路径
+            csv_file: CSV文件路径
+            is_train: 训练模式(True)或验证模式(False)
+            use_segmentation: 是否使用U-Net语义分割
+            unet_path: U-Net模型路径
+        """
+        self.root_dir = Path(root_dir)
+        self.df = pd.read_csv(csv_file)
+        self.is_train = is_train
+        self.use_segmentation = use_segmentation
         
-        # RGB流 - 只用3层卷积
-        self.rgb_stream = nn.Sequential(
-            # Conv1
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(2),  # 224 -> 112
+        # 构建基础路径
+        base_path = self.root_dir / 'comp-90086-nutrition-5-k' / 'Nutrition5K' / 'Nutrition5K'
+        
+        # RGB和Depth目录
+        self.color_dir = base_path / 'train' / 'color'
+        self.depth_dir = base_path / 'train' / 'depth_raw'
+        
+        # 加载U-Net模型
+        self.unet = None
+        if use_segmentation and unet_path and os.path.exists(unet_path):
+            print(f"✓ 加载U-Net模型: {unet_path}")
+            self.unet = UNet(in_channels=1, out_channels=1)
+            checkpoint = torch.load(unet_path, map_location='cpu', weights_only=False)
+            self.unet.load_state_dict(checkpoint['model_state_dict'])
+            self.unet.eval()
+        elif use_segmentation:
+            print("⚠️ U-Net模型未找到，使用简单阈值分割")
+        
+        # 图像变换
+        if is_train:
+            self.rgb_transform = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.RandomRotation(15),
+                transforms.RandomResizedCrop(224, scale=(0.9, 1.0)),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                                   std=[0.229, 0.224, 0.225])
+            ])
+        else:
+            self.rgb_transform = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                                   std=[0.229, 0.224, 0.225])
+            ])
+        
+        self.depth_transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+        ])
+    
+    def segment_with_unet(self, depth_tensor):
+        """使用U-Net生成mask"""
+        with torch.no_grad():
+            # depth_tensor: [1, 224, 224]
+            mask = self.unet(depth_tensor.unsqueeze(0))  # [1, 1, 224, 224]
+            mask = mask.squeeze(0)  # [1, 224, 224]
+        return mask
+    
+    def simple_segment(self, depth_img):
+        """简单阈值分割（备用）"""
+        depth_array = np.array(depth_img, dtype=np.float32)
+        
+        if depth_array.max() > depth_array.min():
+            depth_norm = (depth_array - depth_array.min()) / (depth_array.max() - depth_array.min())
+        else:
+            depth_norm = depth_array
+        
+        threshold = 0.5
+        mask = (depth_norm < threshold).astype(np.float32)
+        
+        return torch.from_numpy(mask).unsqueeze(0)  # [1, 224, 224]
+    
+    def apply_mask_tensor(self, img_tensor, mask_tensor):
+        """将mask应用到tensor图像"""
+        # img_tensor: [C, H, W], mask_tensor: [1, H, W]
+        return img_tensor * mask_tensor
+    
+    def __len__(self):
+        return len(self.df)
+    
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        dish_id = row.iloc[0]
+        calories = row.iloc[1]
+        
+        rgb_path = self.color_dir / dish_id / 'rgb.png'
+        depth_path = self.depth_dir / dish_id / 'depth_raw.png'
+        
+        try:
+            # 读取图像
+            rgb_img = Image.open(rgb_path).convert('RGB')
+            depth_img = Image.open(depth_path)
             
-            # Conv2
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),  # 112 -> 56
+            if depth_img.mode != 'L':
+                depth_img = depth_img.convert('L')
             
-            # Conv3
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1))  # 全局平均池化
-        )
-        
-        # Depth流 - 只用3层卷积
-        self.depth_stream = nn.Sequential(
-            # Conv1
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
+            # 应用变换
+            rgb_tensor = self.rgb_transform(rgb_img)
+            depth_tensor = self.depth_transform(depth_img)
             
-            # Conv2
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
+            # 归一化深度图
+            depth_tensor = (depth_tensor - depth_tensor.min()) / (depth_tensor.max() - depth_tensor.min() + 1e-8)
             
-            # Conv3
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1))
-        )
-        
-        # 融合层 + 回归头 - 更简单
-        self.fusion = nn.Sequential(
-            nn.Linear(256, 128),  # 128 + 128 = 256
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 1)
-        )
-    
-    def forward(self, rgb, depth):
-        # 提取特征
-        rgb_feat = self.rgb_stream(rgb).flatten(1)      # [batch, 128]
-        depth_feat = self.depth_stream(depth).flatten(1) # [batch, 128]
-        
-        # 融合
-        fused = torch.cat([rgb_feat, depth_feat], dim=1) # [batch, 256]
-        
-        # 回归
-        calories = self.fusion(fused).squeeze(1)         # [batch]
-        
-        return calories
-
-
-# ============= 训练函数 =============
-def train_epoch(model, train_loader, criterion, optimizer, device):
-    """训练一个epoch"""
-    model.train()
-    total_loss = 0
-    
-    for rgb, depth, calories in tqdm(train_loader, desc='Training'):
-        rgb = rgb.to(device)
-        depth = depth.to(device)
-        calories = calories.to(device)
-        
-        # 前向传播
-        pred_calories = model(rgb, depth)
-        loss = criterion(pred_calories, calories)
-        
-        # 反向传播
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        
-        total_loss += loss.item()
-    
-    avg_loss = total_loss / len(train_loader)
-    return avg_loss
-
-
-def validate(model, val_loader, criterion, device):
-    """验证"""
-    model.eval()
-    total_loss = 0
-    
-    with torch.no_grad():
-        for rgb, depth, calories in tqdm(val_loader, desc='Validation'):
-            rgb = rgb.to(device)
-            depth = depth.to(device)
-            calories = calories.to(device)
+            # 生成mask
+            if self.use_segmentation:
+                if self.unet is not None:
+                    # 使用U-Net
+                    mask = self.segment_with_unet(depth_tensor)
+                else:
+                    # 使用简单分割
+                    mask = self.simple_segment(depth_img)
+                
+                # 应用mask
+                rgb_tensor = self.apply_mask_tensor(rgb_tensor, mask)
+                depth_tensor = self.apply_mask_tensor(depth_tensor, mask)
             
-            pred_calories = model(rgb, depth)
-            loss = criterion(pred_calories, calories)
-            
-            total_loss += loss.item()
-    
-    avg_loss = total_loss / len(val_loader)
-    return avg_loss
+            return rgb_tensor, depth_tensor, torch.tensor(calories, dtype=torch.float32)
+        
+        except Exception as e:
+            print(f"\n错误: 无法加载 {dish_id}: {str(e)}")
+            return self.__getitem__((idx + 1) % len(self))
 
 
-def plot_training_history(history, save_path='training_results.png'):
-    """绘制训练历史"""
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+def validate_dataset(root_dir, csv_file, cache_file='valid_data_cache.pkl'):
+    """验证数据集完整性"""
+    if os.path.exists(cache_file):
+        print("✓ 发现缓存，直接加载有效数据")
+        with open(cache_file, 'rb') as f:
+            return pickle.load(f)
     
-    epochs = range(1, len(history['train_loss']) + 1)
+    print("检查数据完整性...")
+    root_dir = Path(root_dir)
+    df = pd.read_csv(csv_file)
     
-    # 1. Loss曲线
-    axes[0, 0].plot(epochs, history['train_loss'], 'b-', label='Train Loss', linewidth=2)
-    axes[0, 0].plot(epochs, history['val_loss'], 'r-', label='Val Loss', linewidth=2)
-    axes[0, 0].set_xlabel('Epoch', fontsize=12)
-    axes[0, 0].set_ylabel('Loss (MSE)', fontsize=12)
-    axes[0, 0].set_title('Training and Validation Loss', fontsize=14, fontweight='bold')
-    axes[0, 0].legend(fontsize=11)
-    axes[0, 0].grid(True, alpha=0.3)
+    base_path = root_dir / 'comp-90086-nutrition-5-k' / 'Nutrition5K' / 'Nutrition5K'
+    color_dir = base_path / 'train' / 'color'
+    depth_dir = base_path / 'train' / 'depth_raw'
     
-    # 2. RMSE曲线
-    axes[0, 1].plot(epochs, history['val_rmse'], 'g-', linewidth=2)
-    axes[0, 1].set_xlabel('Epoch', fontsize=12)
-    axes[0, 1].set_ylabel('RMSE', fontsize=12)
-    axes[0, 1].set_title('Validation RMSE', fontsize=14, fontweight='bold')
-    axes[0, 1].grid(True, alpha=0.3)
+    valid_rows = []
     
-    # 找到最佳epoch
-    best_epoch = np.argmin(history['val_loss']) + 1
-    best_rmse = history['val_rmse'][best_epoch - 1]
-    axes[0, 1].axvline(x=best_epoch, color='r', linestyle='--', linewidth=2, 
-                       label=f'Best: Epoch {best_epoch}, RMSE={best_rmse:.2f}')
-    axes[0, 1].legend(fontsize=10)
+    for idx in range(len(df)):
+        dish_id = df.iloc[idx, 0]
+        rgb_path = color_dir / dish_id / 'rgb.png'
+        depth_path = depth_dir / dish_id / 'depth_raw.png'
+        
+        try:
+            if rgb_path.exists() and depth_path.exists():
+                Image.open(rgb_path).convert('RGB')
+                Image.open(depth_path)
+                valid_rows.append(df.iloc[idx])
+        except Exception as e:
+            print(f"  跳过损坏的样本: {dish_id} - {str(e)}")
     
-    # 3. Train vs Val Loss对比
-    axes[1, 0].plot(epochs, history['train_loss'], 'b-', label='Train', linewidth=2)
-    axes[1, 0].plot(epochs, history['val_loss'], 'r-', label='Validation', linewidth=2)
-    axes[1, 0].fill_between(epochs, history['train_loss'], history['val_loss'], 
-                            alpha=0.3, color='gray', label='Gap')
-    axes[1, 0].set_xlabel('Epoch', fontsize=12)
-    axes[1, 0].set_ylabel('Loss', fontsize=12)
-    axes[1, 0].set_title('Overfitting Check (Train-Val Gap)', fontsize=14, fontweight='bold')
-    axes[1, 0].legend(fontsize=11)
-    axes[1, 0].grid(True, alpha=0.3)
+    valid_df = pd.DataFrame(valid_rows).reset_index(drop=True)
     
-    # 4. 统计摘要
-    axes[1, 1].axis('off')
-    summary_text = f"""
-    Training Summary
-    ================
+    with open(cache_file, 'wb') as f:
+        pickle.dump(valid_df, f)
     
-    Total Epochs: {len(epochs)}
+    print(f"✓ 有效样本数: {len(valid_df)} / {len(df)}")
+    print(f"✓ 缓存已保存到 {cache_file}")
     
-    Best Performance:
-    • Epoch: {best_epoch}
-    • Val Loss: {history['val_loss'][best_epoch-1]:.4f}
-    • Val RMSE: {best_rmse:.4f}
-    
-    Final Performance:
-    • Train Loss: {history['train_loss'][-1]:.4f}
-    • Val Loss: {history['val_loss'][-1]:.4f}
-    • Val RMSE: {history['val_rmse'][-1]:.4f}
-    
-    Improvement:
-    • Initial RMSE: {history['val_rmse'][0]:.4f}
-    • Best RMSE: {best_rmse:.4f}
-    • Reduction: {history['val_rmse'][0] - best_rmse:.4f}
+    return valid_df
+
+
+def get_dataloaders(root_dir, csv_file, batch_size=16, val_split=0.2, use_segmentation=True, unet_path='checkpoints/unet_best.pth'):
     """
-    axes[1, 1].text(0.1, 0.5, summary_text, fontsize=12, family='monospace',
-                    verticalalignment='center')
+    创建训练和验证数据加载器
     
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f"\n✓ 训练曲线已保存: {save_path}")
-    plt.close()
-
-
-# ============= 主训练流程 =============
-def main():
-    # 超参数 - 针对小数据集优化
-    BATCH_SIZE = 32
-    EPOCHS = 40
-    LEARNING_RATE = 0.001  
-    VAL_SPLIT = 0.2
-    USE_SEGMENTATION = True  # 是否使用语义分割
+    Args:
+        use_segmentation: 是否使用U-Net语义分割
+        unet_path: U-Net模型路径
+    """
+    valid_df = validate_dataset(root_dir, csv_file)
     
-    # 路径
-    ROOT_DIR = '/Users/hanlinxuan/Desktop/Learning/Unimelb/2025 S2/CV/Assignment/Project/content'
-    CSV_FILE = '/Users/hanlinxuan/Desktop/Learning/Unimelb/2025 S2/CV/Assignment/Project/content/comp-90086-nutrition-5-k/Nutrition5K/Nutrition5K/nutrition5k_train.csv'
+    n_val = int(len(valid_df) * val_split)
+    np.random.seed(42)
+    indices = np.random.permutation(len(valid_df))
     
-    # 设备
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-        print("✅ 使用 Apple Silicon GPU (MPS)")
-    else:
-        device = torch.device("cpu")
-        print("⚠️ 使用 CPU")
+    train_indices = indices[n_val:]
+    val_indices = indices[:n_val]
     
-    print(f"设备: {device}")
-    print(f"语义分割: {'启用' if USE_SEGMENTATION else '关闭'}")
+    train_df = valid_df.iloc[train_indices].reset_index(drop=True)
+    val_df = valid_df.iloc[val_indices].reset_index(drop=True)
     
-    # 创建保存目录
-    os.makedirs('checkpoints', exist_ok=True)
+    train_df.to_csv('train_split.csv', index=False)
+    val_df.to_csv('val_split.csv', index=False)
     
-    # 数据加载
-    print("\n加载数据...")
-    train_loader, val_loader = get_dataloaders(
-        root_dir=ROOT_DIR,
-        csv_file=CSV_FILE,
-        batch_size=BATCH_SIZE,
-        val_split=VAL_SPLIT,
-        use_segmentation=USE_SEGMENTATION,
-        unet_path='checkpoints/unet_best.pth'  # 指定U-Net路径
-)
-    print(f"训练集: {len(train_loader.dataset)} 样本")
-    print(f"验证集: {len(val_loader.dataset)} 样本")
+    train_dataset = Nutrition5kDataset(root_dir, 'train_split.csv', is_train=True, 
+                                       use_segmentation=use_segmentation, unet_path=unet_path)
+    val_dataset = Nutrition5kDataset(root_dir, 'val_split.csv', is_train=False, 
+                                     use_segmentation=use_segmentation, unet_path=unet_path)
     
-    # 创建模型
-    print("\n创建模型...")
-    model = CalorieEstimatorCNN().to(device)
-    
-    # 打印模型参数量
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"模型参数量: {total_params:,} (可训练: {trainable_params:,})")
-    
-    # 损失函数和优化器
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
-    
-    # 学习率调度器
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-6
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=False
     )
     
-    # 记录训练历史
-    history = {
-        'train_loss': [],
-        'val_loss': [],
-        'val_rmse': []
-    }
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False
+    )
     
-    # 训练
-    print("\n开始训练...\n")
-    best_val_loss = float('inf')
-    patience_counter = 0
-    early_stop_patience = 20
+    return train_loader, val_loader
+
+
+class Nutrition5kTestDataset(Dataset):
+    def __init__(self, root_dir, use_segmentation=True, unet_path='checkpoints/unet_best.pth'):
+        """测试集数据加载器"""
+        self.root_dir = Path(root_dir)
+        self.use_segmentation = use_segmentation
+        base_path = self.root_dir / 'comp-90086-nutrition-5-k' / 'Nutrition5K' / 'Nutrition5K'
+        
+        self.color_dir = base_path / 'test' / 'color'
+        self.depth_dir = base_path / 'test' / 'depth_raw'
+        
+        self.dish_ids = sorted([d.name for d in self.color_dir.iterdir() if d.is_dir()])
+        
+        # 加载U-Net
+        self.unet = None
+        if use_segmentation and unet_path and os.path.exists(unet_path):
+            self.unet = UNet(in_channels=1, out_channels=1)
+            checkpoint = torch.load(unet_path, map_location='cpu', weights_only=False)
+            self.unet.load_state_dict(checkpoint['model_state_dict'])
+            self.unet.eval()
+        
+        self.rgb_transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                               std=[0.229, 0.224, 0.225])
+        ])
+        
+        self.depth_transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+        ])
     
-    for epoch in range(EPOCHS):
-        print(f"Epoch {epoch+1}/{EPOCHS}")
-        print("-" * 50)
+    def segment_with_unet(self, depth_tensor):
+        """使用U-Net生成mask"""
+        with torch.no_grad():
+            mask = self.unet(depth_tensor.unsqueeze(0))
+            mask = mask.squeeze(0)
+        return mask
+    
+    def simple_segment(self, depth_img):
+        """简单阈值分割"""
+        depth_array = np.array(depth_img, dtype=np.float32)
         
-        # 训练
-        train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
-        
-        # 验证
-        val_loss = validate(model, val_loader, criterion, device)
-        val_rmse = np.sqrt(val_loss)
-        
-        # 记录当前学习率
-        current_lr = optimizer.param_groups[0]['lr']
-        
-        # 调整学习率
-        old_lr = current_lr
-        scheduler.step(val_loss)
-        new_lr = optimizer.param_groups[0]['lr']
-        
-        # 记录历史
-        history['train_loss'].append(train_loss)
-        history['val_loss'].append(val_loss)
-        history['val_rmse'].append(val_rmse)
-        
-        print(f"Train Loss: {train_loss:.4f}")
-        print(f"Val Loss: {val_loss:.4f}")
-        print(f"Val RMSE: {val_rmse:.4f}")
-        print(f"Learning Rate: {new_lr:.6f}")
-        
-        # 如果学习率改变了，打印提示
-        if new_lr < old_lr:
-            print(f"⚠ 学习率降低: {old_lr:.6f} -> {new_lr:.6f}")
-        
-        # 保存最佳模型
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': val_loss,
-                'val_rmse': val_rmse,
-            }, 'checkpoints/best_model.pth')
-            print(f"✓ 保存最佳模型 (Val Loss: {val_loss:.4f}, RMSE: {val_rmse:.4f})")
+        if depth_array.max() > depth_array.min():
+            depth_norm = (depth_array - depth_array.min()) / (depth_array.max() - depth_array.min())
         else:
-            patience_counter += 1
-            if patience_counter >= early_stop_patience:
-                print(f"\n⚠ 早停触发！{early_stop_patience} 个epoch没有改善")
-                break
+            depth_norm = depth_array
         
-        print()
+        threshold = 0.5
+        mask = (depth_norm < threshold).astype(np.float32)
+        
+        return torch.from_numpy(mask).unsqueeze(0)
     
-    # 保存训练历史
-    np.save('checkpoints/training_history.npy', history)
+    def apply_mask_tensor(self, img_tensor, mask_tensor):
+        """将mask应用到tensor"""
+        return img_tensor * mask_tensor
     
-    # 绘制训练曲线
-    print("\n生成训练可视化...")
-    plot_training_history(history, save_path='checkpoints/training_results.png')
+    def __len__(self):
+        return len(self.dish_ids)
     
-    print("\n训练完成！")
-    print(f"最佳验证Loss: {best_val_loss:.4f}")
-    print(f"最佳验证RMSE: {np.sqrt(best_val_loss):.4f}")
-    
-    # 打印最后几个epoch的结果
-    print("\n最后5个epoch:")
-    for i in range(max(0, len(history['val_rmse'])-5), len(history['val_rmse'])):
-        print(f"  Epoch {i+1}: Train Loss={history['train_loss'][i]:.4f}, "
-              f"Val Loss={history['val_loss'][i]:.4f}, "
-              f"Val RMSE={history['val_rmse'][i]:.4f}")
-
-
-if __name__ == '__main__':
-    main()
+    def __getitem__(self, idx):
+        dish_id = self.dish_ids[idx]
+        
+        rgb_path = self.color_dir / dish_id / 'rgb.png'
+        depth_path = self.depth_dir / dish_id / 'depth_raw.png'
+        
+        rgb_img = Image.open(rgb_path).convert('RGB')
+        depth_img = Image.open(depth_path).convert('L')
+        
+        rgb_tensor = self.rgb_transform(rgb_img)
+        depth_tensor = self.depth_transform(depth_img)
+        depth_tensor = (depth_tensor - depth_tensor.min()) / (depth_tensor.max() - depth_tensor.min() + 1e-8)
+        
+        # 生成mask
+        if self.use_segmentation:
+            if self.unet is not None:
+                mask = self.segment_with_unet(depth_tensor)
+            else:
+                mask = self.simple_segment(depth_img)
+            
+            rgb_tensor = self.apply_mask_tensor(rgb_tensor, mask)
+            depth_tensor = self.apply_mask_tensor(depth_tensor, mask)
+        
+        return rgb_tensor, depth_tensor, dish_id
