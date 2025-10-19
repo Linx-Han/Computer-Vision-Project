@@ -1,256 +1,325 @@
-# data.py
-import os
-import pandas as pd
-import numpy as np
+# model.py
 import torch
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-from PIL import Image
-from pathlib import Path
-import pickle
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from tqdm import tqdm
+import os
+import matplotlib.pyplot as plt
+from data import get_dataloaders
+from autoencoder import ImageEncoder
 
-class Nutrition5kDataset(Dataset):
-    def __init__(self, root_dir, csv_file, is_train=True):
-        """
-        Args:
-            root_dir: content文件夹路径
-            csv_file: CSV文件路径
-            is_train: 训练模式(True)或验证模式(False)
-        """
-        self.root_dir = Path(root_dir)
-        self.df = pd.read_csv(csv_file)
-        self.is_train = is_train
+# ============= 使用预训练Encoder的CNN模型 =============
+class CalorieEstimatorCNN(nn.Module):
+    """使用Autoencoder预训练的双流CNN"""
+    def __init__(self, use_pretrained=True, pretrained_path=None):
+        super(CalorieEstimatorCNN, self).__init__()
         
-        # 构建基础路径
-        # / 'comp-90086-nutrition-5-k' / 'Nutrition5K' / 'Nutrition5K'
-        base_path = self.root_dir 
+        # RGB流 - 使用预训练的Encoder
+        self.rgb_stream = ImageEncoder(in_channels=3, embedding_size=128)
         
-        # RGB和Depth目录
-        self.color_dir = base_path / 'train' / 'color'
-        self.depth_dir = base_path / 'train' / 'depth_raw'
+        # Depth流 - 使用预训练的Encoder
+        self.depth_stream = ImageEncoder(in_channels=1, embedding_size=128)
         
-        # 图像变换
-        if is_train:
-            self.rgb_transform = transforms.Compose([
-                transforms.Resize((224, 224)),
-                transforms.RandomRotation(15),
-                transforms.RandomResizedCrop(224, scale=(0.9, 1.0)),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                                   std=[0.229, 0.224, 0.225])
-            ])
+        # 加载预训练权重
+        if use_pretrained and pretrained_path and os.path.exists(pretrained_path):
+            print(f"✓ 加载预训练Encoder: {pretrained_path}")
+            checkpoint = torch.load(pretrained_path, map_location='cpu', weights_only=False)
+            self.rgb_stream.load_state_dict(checkpoint['rgb_encoder'])
+            self.depth_stream.load_state_dict(checkpoint['depth_encoder'])
+            print("✓ 预训练权重加载完成")
         else:
-            self.rgb_transform = transforms.Compose([
-                transforms.Resize((224, 224)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                                   std=[0.229, 0.224, 0.225])
-            ])
+            print("⚠️ 从随机初始化开始训练")
         
-        self.depth_transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-        ])
+        # 融合层 + 回归头
+        self.fusion = nn.Sequential(
+            nn.Linear(256, 128),  # 128 + 128 = 256
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 1)
+        )
     
-    def __len__(self):
-        return len(self.df)
+    def forward(self, rgb, depth):
+        # 提取特征
+        rgb_feat = self.rgb_stream(rgb)      # [batch, 128]
+        depth_feat = self.depth_stream(depth) # [batch, 128]
+        
+        # 融合
+        fused = torch.cat([rgb_feat, depth_feat], dim=1) # [batch, 256]
+        
+        # 回归
+        calories = self.fusion(fused).squeeze(1)         # [batch]
+        
+        return calories
+
+
+# ============= 训练函数 =============
+def train_epoch(model, train_loader, criterion, optimizer, device):
+    """训练一个epoch"""
+    model.train()
+    total_loss = 0
     
-    def __getitem__(self, idx):
-        # 获取dish_id和calories
-        row = self.df.iloc[idx]
-        dish_id = row.iloc[0]
-        calories = row.iloc[1]
+    for rgb, depth, calories in tqdm(train_loader, desc='Training'):
+        rgb = rgb.to(device)
+        depth = depth.to(device)
+        calories = calories.to(device)
         
-        # 构建图像路径
-        rgb_path = self.color_dir / dish_id / 'rgb.png'
-        depth_path = self.depth_dir / dish_id / 'depth_raw.png'
+        # 前向传播
+        pred_calories = model(rgb, depth)
+        loss = criterion(pred_calories, calories)
         
-        try:
-            # 读取图像
-            rgb_img = Image.open(rgb_path).convert('RGB')
-            depth_img = Image.open(depth_path)
+        # 反向传播
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item()
+    
+    avg_loss = total_loss / len(train_loader)
+    return avg_loss
+
+
+def validate(model, val_loader, criterion, device):
+    """验证"""
+    model.eval()
+    total_loss = 0
+    
+    with torch.no_grad():
+        for rgb, depth, calories in tqdm(val_loader, desc='Validation'):
+            rgb = rgb.to(device)
+            depth = depth.to(device)
+            calories = calories.to(device)
             
-            # 处理深度图
-            if depth_img.mode != 'L':
-                depth_img = depth_img.convert('L')
+            pred_calories = model(rgb, depth)
+            loss = criterion(pred_calories, calories)
             
-            # 应用变换
-            rgb_img = self.rgb_transform(rgb_img)
-            depth_img = self.depth_transform(depth_img)
-            
-            # 归一化深度图到[0,1]
-            depth_img = (depth_img - depth_img.min()) / (depth_img.max() - depth_img.min() + 1e-8)
-            
-            return rgb_img, depth_img, torch.tensor(calories, dtype=torch.float32)
-        
-        except Exception as e:
-            print(f"\n错误: 无法加载 {dish_id}: {str(e)}")
-            # 返回下一个样本
-            return self.__getitem__((idx + 1) % len(self))
+            total_loss += loss.item()
+    
+    avg_loss = total_loss / len(val_loader)
+    return avg_loss
 
 
-def validate_dataset(root_dir, csv_file, cache_file='valid_data_cache.pkl'):
+def plot_training_history(history, save_path='training_results.png'):
+    """绘制训练历史"""
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    epochs = range(1, len(history['train_loss']) + 1)
+    
+    # 1. Loss曲线
+    axes[0, 0].plot(epochs, history['train_loss'], 'b-', label='Train Loss', linewidth=2)
+    axes[0, 0].plot(epochs, history['val_loss'], 'r-', label='Val Loss', linewidth=2)
+    axes[0, 0].set_xlabel('Epoch', fontsize=12)
+    axes[0, 0].set_ylabel('Loss (MSE)', fontsize=12)
+    axes[0, 0].set_title('Training and Validation Loss', fontsize=14, fontweight='bold')
+    axes[0, 0].legend(fontsize=11)
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # 2. RMSE曲线
+    axes[0, 1].plot(epochs, history['val_rmse'], 'g-', linewidth=2)
+    axes[0, 1].set_xlabel('Epoch', fontsize=12)
+    axes[0, 1].set_ylabel('RMSE', fontsize=12)
+    axes[0, 1].set_title('Validation RMSE', fontsize=14, fontweight='bold')
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # 找到最佳epoch
+    best_epoch = np.argmin(history['val_loss']) + 1
+    best_rmse = history['val_rmse'][best_epoch - 1]
+    axes[0, 1].axvline(x=best_epoch, color='r', linestyle='--', linewidth=2, 
+                       label=f'Best: Epoch {best_epoch}, RMSE={best_rmse:.2f}')
+    axes[0, 1].legend(fontsize=10)
+    
+    # 3. Train vs Val Loss对比
+    axes[1, 0].plot(epochs, history['train_loss'], 'b-', label='Train', linewidth=2)
+    axes[1, 0].plot(epochs, history['val_loss'], 'r-', label='Validation', linewidth=2)
+    axes[1, 0].fill_between(epochs, history['train_loss'], history['val_loss'], 
+                            alpha=0.3, color='gray', label='Gap')
+    axes[1, 0].set_xlabel('Epoch', fontsize=12)
+    axes[1, 0].set_ylabel('Loss', fontsize=12)
+    axes[1, 0].set_title('Overfitting Check', fontsize=14, fontweight='bold')
+    axes[1, 0].legend(fontsize=11)
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # 4. 统计摘要
+    axes[1, 1].axis('off')
+    summary_text = f"""
+    Training Summary
+    ================
+    
+    Total Epochs: {len(epochs)}
+    
+    Best Performance:
+    • Epoch: {best_epoch}
+    • Val Loss: {history['val_loss'][best_epoch-1]:.4f}
+    • Val RMSE: {best_rmse:.4f}
+    
+    Final Performance:
+    • Train Loss: {history['train_loss'][-1]:.4f}
+    • Val Loss: {history['val_loss'][-1]:.4f}
+    • Val RMSE: {history['val_rmse'][-1]:.4f}
+    
+    Improvement:
+    • Initial RMSE: {history['val_rmse'][0]:.4f}
+    • Best RMSE: {best_rmse:.4f}
+    • Reduction: {history['val_rmse'][0] - best_rmse:.4f}
     """
-    验证数据集完整性，返回过滤后的DataFrame
-    """
-    # 检查缓存
-    if os.path.exists(cache_file):
-        print("✓ 发现缓存，直接加载有效数据")
-        with open(cache_file, 'rb') as f:
-            return pickle.load(f)
+    axes[1, 1].text(0.1, 0.5, summary_text, fontsize=12, family='monospace',
+                    verticalalignment='center')
     
-    print("检查数据完整性...")
-    root_dir = Path(root_dir)
-    df = pd.read_csv(csv_file)
-    
-    base_path = root_dir / 'comp-90086-nutrition-5-k' / 'Nutrition5K' / 'Nutrition5K'
-    color_dir = base_path / 'train' / 'color'
-    depth_dir = base_path / 'train' / 'depth_raw'
-    
-    valid_rows = []
-    
-    for idx in range(len(df)):
-        dish_id = df.iloc[idx, 0]
-        rgb_path = color_dir / dish_id / 'rgb.png'
-        depth_path = depth_dir / dish_id / 'depth_raw.png'
-        
-        try:
-            if rgb_path.exists() and depth_path.exists():
-                Image.open(rgb_path).convert('RGB')
-                Image.open(depth_path)
-                valid_rows.append(df.iloc[idx])
-        except Exception as e:
-            print(f"  跳过损坏的样本: {dish_id} - {str(e)}")
-    
-    # 创建有效数据的DataFrame
-    valid_df = pd.DataFrame(valid_rows).reset_index(drop=True)
-    
-    # 保存缓存
-    with open(cache_file, 'wb') as f:
-        pickle.dump(valid_df, f)
-    
-    print(f"✓ 有效样本数: {len(valid_df)} / {len(df)}")
-    print(f"✓ 缓存已保存到 {cache_file}")
-    
-    return valid_df
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"\n✓ 训练曲线已保存: {save_path}")
+    plt.close()
 
 
-# 创建数据加载器
-def get_dataloaders(root_dir, csv_file, batch_size=16, val_split=0.2):
-    """
-    创建训练和验证数据加载器
-    """
-    # 先验证并获取有效数据
-    valid_df = validate_dataset(root_dir, csv_file)
+# ============= 主训练流程 =============
+def main():
+    print("=" * 60)
+    print("步骤3: 训练CNN (使用预训练的Autoencoder)")
+    print("=" * 60)
     
-    # 划分训练集和验证集
-    n_val = int(len(valid_df) * val_split)
+    # 超参数
+    BATCH_SIZE = 32
+    EPOCHS = 40
+    LEARNING_RATE = 0.0005  # 使用预训练时降低学习率
+    VAL_SPLIT = 0.2
+    USE_PRETRAINED = True  # 是否使用预训练Encoder
     
-    # 使用固定的随机种子，确保每次划分一致
-    np.random.seed(42)
-    indices = np.random.permutation(len(valid_df))
-    
-    train_indices = indices[n_val:]
-    val_indices = indices[:n_val]
-    
-    # 创建训练和验证CSV
-    train_df = valid_df.iloc[train_indices].reset_index(drop=True)
-    val_df = valid_df.iloc[val_indices].reset_index(drop=True)
-    
-    # 保存临时CSV
-    train_df.to_csv('train_split.csv', index=False)
-    val_df.to_csv('val_split.csv', index=False)
-    
-    # 创建数据集
-    train_dataset = Nutrition5kDataset(root_dir, 'train_split.csv', is_train=True)
-    val_dataset = Nutrition5kDataset(root_dir, 'val_split.csv', is_train=False)
-    
-    # 创建数据加载器
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=False
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=False
-    )
-    
-    return train_loader, val_loader
-
-
-# 测试数据集类（用于Kaggle提交）
-class Nutrition5kTestDataset(Dataset):
-    def __init__(self, root_dir):
-        """测试集数据加载器"""
-        self.root_dir = Path(root_dir)
-        base_path = self.root_dir / 'comp-90086-nutrition-5-k' / 'Nutrition5K' / 'Nutrition5K'
-        
-        self.color_dir = base_path / 'test' / 'color'
-        self.depth_dir = base_path / 'test' / 'depth_raw'
-        
-        # 获取所有dish_id
-        self.dish_ids = sorted([d.name for d in self.color_dir.iterdir() if d.is_dir()])
-        
-        self.rgb_transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                               std=[0.229, 0.224, 0.225])
-        ])
-        
-        self.depth_transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-        ])
-    
-    def __len__(self):
-        return len(self.dish_ids)
-    
-    def __getitem__(self, idx):
-        dish_id = self.dish_ids[idx]
-        
-        rgb_path = self.color_dir / dish_id / 'rgb.png'
-        depth_path = self.depth_dir / dish_id / 'depth_raw.png'
-        
-        rgb_img = Image.open(rgb_path).convert('RGB')
-        depth_img = Image.open(depth_path).convert('L')
-        
-        rgb_img = self.rgb_transform(rgb_img)
-        depth_img = self.depth_transform(depth_img)
-        depth_img = (depth_img - depth_img.min()) / (depth_img.max() - depth_img.min() + 1e-8)
-        
-        return rgb_img, depth_img, dish_id
-
-
-# ============= 使用示例 =============
-if __name__ == '__main__':
-    # 设置路径
+    # 路径
     ROOT_DIR = '/Users/hanlinxuan/Desktop/Learning/Unimelb/2025 S2/CV/Assignment/Project/content'
     CSV_FILE = '/Users/hanlinxuan/Desktop/Learning/Unimelb/2025 S2/CV/Assignment/Project/content/comp-90086-nutrition-5-k/Nutrition5K/Nutrition5K/nutrition5k_train.csv'
     
-    # 创建数据加载器（第一次会检查，之后用缓存）
+    # 设备
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("✅ 使用 Apple Silicon GPU (MPS)")
+    else:
+        device = torch.device("cpu")
+        print("⚠️ 使用 CPU")
+    
+    print(f"设备: {device}")
+    print(f"预训练Encoder: {'启用' if USE_PRETRAINED else '关闭'}")
+    
+    # 创建保存目录
+    os.makedirs('checkpoints', exist_ok=True)
+    
+    # 数据加载
+    print("\n加载数据...")
     train_loader, val_loader = get_dataloaders(
         root_dir=ROOT_DIR,
         csv_file=CSV_FILE,
-        batch_size=16,
-        val_split=0.2
+        batch_size=BATCH_SIZE,
+        val_split=VAL_SPLIT
+    )
+    print(f"训练集: {len(train_loader.dataset)} 样本")
+    print(f"验证集: {len(val_loader.dataset)} 样本")
+    
+    # 创建模型
+    print("\n创建模型...")
+    model = CalorieEstimatorCNN(
+        use_pretrained=USE_PRETRAINED,
+        pretrained_path='checkpoints/autoencoder_best.pth'
+    ).to(device)
+    
+    # 打印模型参数量
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"模型参数量: {total_params:,} (可训练: {trainable_params:,})")
+    
+    # 损失函数和优化器 - 使用AdamW
+    criterion = nn.MSELoss()
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
+    
+    # 学习率调度器
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-6
     )
     
-    print(f"\n训练集大小: {len(train_loader.dataset)}")
-    print(f"验证集大小: {len(val_loader.dataset)}")
+    # 记录训练历史
+    history = {
+        'train_loss': [],
+        'val_loss': [],
+        'val_rmse': []
+    }
     
-    # 测试加载一个batch
-    rgb, depth, calories = next(iter(train_loader))
-    print(f"\nRGB shape: {rgb.shape}")
-    print(f"Depth shape: {depth.shape}")
-    print(f"Calories shape: {calories.shape}")
+    # 训练
+    print("\n开始训练...\n")
+    best_val_loss = float('inf')
+    patience_counter = 0
+    early_stop_patience = 20
     
-    print("\n✅ 数据预处理完成！")
+    for epoch in range(EPOCHS):
+        print(f"Epoch {epoch+1}/{EPOCHS}")
+        print("-" * 50)
+        
+        # 训练
+        train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
+        
+        # 验证
+        val_loss = validate(model, val_loader, criterion, device)
+        val_rmse = np.sqrt(val_loss)
+        
+        # 记录当前学习率
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # 调整学习率
+        old_lr = current_lr
+        scheduler.step(val_loss)
+        new_lr = optimizer.param_groups[0]['lr']
+        
+        # 记录历史
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['val_rmse'].append(val_rmse)
+        
+        print(f"Train Loss: {train_loss:.4f}")
+        print(f"Val Loss: {val_loss:.4f}")
+        print(f"Val RMSE: {val_rmse:.4f}")
+        print(f"Learning Rate: {new_lr:.6f}")
+        
+        # 如果学习率改变了，打印提示
+        if new_lr < old_lr:
+            print(f"⚠ 学习率降低: {old_lr:.6f} -> {new_lr:.6f}")
+        
+        # 保存最佳模型
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': val_loss,
+                'val_rmse': val_rmse,
+            }, 'checkpoints/best_model.pth')
+            print(f"✓ 保存最佳模型 (Val Loss: {val_loss:.4f}, RMSE: {val_rmse:.4f})")
+        else:
+            patience_counter += 1
+            if patience_counter >= early_stop_patience:
+                print(f"\n⚠ 早停触发！{early_stop_patience} 个epoch没有改善")
+                break
+        
+        print()
+    
+    # 保存训练历史
+    np.save('checkpoints/training_history.npy', history)
+    
+    # 绘制训练曲线
+    print("\n生成训练可视化...")
+    plot_training_history(history, save_path='checkpoints/training_results.png')
+    
+    print("\n训练完成！")
+    print(f"最佳验证Loss: {best_val_loss:.4f}")
+    print(f"最佳验证RMSE: {np.sqrt(best_val_loss):.4f}")
+    
+    # 打印最后几个epoch的结果
+    print("\n最后5个epoch:")
+    for i in range(max(0, len(history['val_rmse'])-5), len(history['val_rmse'])):
+        print(f"  Epoch {i+1}: Train Loss={history['train_loss'][i]:.4f}, "
+              f"Val Loss={history['val_loss'][i]:.4f}, "
+              f"Val RMSE={history['val_rmse'][i]:.4f}")
+    
+    print("\n下一步: 运行 predict.py 生成提交文件")
+
+
+if __name__ == '__main__':
+    main()
