@@ -1,55 +1,59 @@
-# data.py
-import os
-import pandas as pd
+"""
+Data loading and preprocessing for Nutrition5k dataset
+"""
+import pickle
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
 from pathlib import Path
-import pickle
+
+from config import Config
+
 
 class Nutrition5kDataset(Dataset):
-    def __init__(self, root_dir, csv_file, is_train=True):
+    """Dataset class for Nutrition5k training/validation data"""
+    
+    def __init__(self, csv_file, is_train=True):
         """
         Args:
-            root_dir: content文件夹路径
-            csv_file: CSV文件路径
-            is_train: 训练模式(True)或验证模式(False)
+            csv_file: Path to CSV file containing dish_id and calories
+            is_train: If True, apply data augmentation
         """
-        self.root_dir = Path(root_dir)
         self.df = pd.read_csv(csv_file)
         self.is_train = is_train
         
-        # 构建基础路径
-        # / 'comp-90086-nutrition-5-k' / 'Nutrition5K' / 'Nutrition5K'
-        base_path = self.root_dir 
-        
-        # RGB和Depth目录
-        self.color_dir = base_path / 'train' / 'color'
-        self.depth_dir = base_path / 'train' / 'depth_raw'
-        
-        # 图像变换
+        # Define transforms
+        self.rgb_transform = self._get_rgb_transform(is_train)
+        self.depth_transform = self._get_depth_transform()
+    
+    def _get_rgb_transform(self, is_train):
+        """Get RGB image transforms"""
         if is_train:
-            self.rgb_transform = transforms.Compose([
-                transforms.Resize((224, 224)),
-                transforms.RandomRotation(15),
-                transforms.RandomResizedCrop(224, scale=(0.9, 1.0)),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            return transforms.Compose([
+                transforms.Resize((Config.IMAGE_SIZE, Config.IMAGE_SIZE)),
+                transforms.RandomRotation(Config.ROTATION_DEGREES),
+                transforms.RandomResizedCrop(Config.IMAGE_SIZE, scale=Config.CROP_SCALE),
+                transforms.ColorJitter(
+                    brightness=Config.COLOR_JITTER_BRIGHTNESS,
+                    contrast=Config.COLOR_JITTER_CONTRAST
+                ),
                 transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                                   std=[0.229, 0.224, 0.225])
+                transforms.Normalize(mean=Config.RGB_MEAN, std=Config.RGB_STD)
             ])
         else:
-            self.rgb_transform = transforms.Compose([
-                transforms.Resize((224, 224)),
+            return transforms.Compose([
+                transforms.Resize((Config.IMAGE_SIZE, Config.IMAGE_SIZE)),
                 transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                                   std=[0.229, 0.224, 0.225])
+                transforms.Normalize(mean=Config.RGB_MEAN, std=Config.RGB_STD)
             ])
-        
-        self.depth_transform = transforms.Compose([
-            transforms.Resize((224, 224)),
+    
+    def _get_depth_transform(self):
+        """Get depth image transforms"""
+        return transforms.Compose([
+            transforms.Resize((Config.IMAGE_SIZE, Config.IMAGE_SIZE)),
             transforms.ToTensor(),
         ])
     
@@ -57,157 +61,52 @@ class Nutrition5kDataset(Dataset):
         return len(self.df)
     
     def __getitem__(self, idx):
-        # 获取dish_id和calories
-        row = self.df.iloc[idx]
-        dish_id = row.iloc[0]
-        calories = row.iloc[1]
-        
-        # 构建图像路径
-        rgb_path = self.color_dir / dish_id / 'rgb.png'
-        depth_path = self.depth_dir / dish_id / 'depth_raw.png'
-        
         try:
-            # 读取图像
+            # Get dish_id and calories
+            row = self.df.iloc[idx]
+            dish_id = row.iloc[0]
+            calories = row.iloc[1]
+            
+            # Build image paths
+            rgb_path = Config.TRAIN_COLOR_DIR / dish_id / 'rgb.png'
+            depth_path = Config.TRAIN_DEPTH_DIR / dish_id / 'depth_raw.png'
+            
+            # Load images
             rgb_img = Image.open(rgb_path).convert('RGB')
-            depth_img = Image.open(depth_path)
+            depth_img = Image.open(depth_path).convert('L')
             
-            # 处理深度图
-            if depth_img.mode != 'L':
-                depth_img = depth_img.convert('L')
-            
-            # 应用变换
+            # Apply transforms
             rgb_img = self.rgb_transform(rgb_img)
             depth_img = self.depth_transform(depth_img)
             
-            # 归一化深度图到[0,1]
+            # Normalize depth to [0, 1]
             depth_img = (depth_img - depth_img.min()) / (depth_img.max() - depth_img.min() + 1e-8)
             
             return rgb_img, depth_img, torch.tensor(calories, dtype=torch.float32)
         
         except Exception as e:
-            print(f"\n错误: 无法加载 {dish_id}: {str(e)}")
-            # 返回下一个样本
+            print(f"\n⚠️  Error loading {dish_id}: {str(e)}")
+            # Return next sample on error
             return self.__getitem__((idx + 1) % len(self))
 
 
-def validate_dataset(root_dir, csv_file, cache_file='valid_data_cache.pkl'):
-    """
-    验证数据集完整性，返回过滤后的DataFrame
-    """
-    # 检查缓存
-    if os.path.exists(cache_file):
-        print("✓ 发现缓存，直接加载有效数据")
-        with open(cache_file, 'rb') as f:
-            return pickle.load(f)
-    
-    print("检查数据完整性...")
-    root_dir = Path(root_dir)
-    df = pd.read_csv(csv_file)
-    
-    base_path = root_dir / 'comp-90086-nutrition-5-k' / 'Nutrition5K' / 'Nutrition5K'
-    color_dir = base_path / 'train' / 'color'
-    depth_dir = base_path / 'train' / 'depth_raw'
-    
-    valid_rows = []
-    
-    for idx in range(len(df)):
-        dish_id = df.iloc[idx, 0]
-        rgb_path = color_dir / dish_id / 'rgb.png'
-        depth_path = depth_dir / dish_id / 'depth_raw.png'
-        
-        try:
-            if rgb_path.exists() and depth_path.exists():
-                Image.open(rgb_path).convert('RGB')
-                Image.open(depth_path)
-                valid_rows.append(df.iloc[idx])
-        except Exception as e:
-            print(f"  跳过损坏的样本: {dish_id} - {str(e)}")
-    
-    # 创建有效数据的DataFrame
-    valid_df = pd.DataFrame(valid_rows).reset_index(drop=True)
-    
-    # 保存缓存
-    with open(cache_file, 'wb') as f:
-        pickle.dump(valid_df, f)
-    
-    print(f"✓ 有效样本数: {len(valid_df)} / {len(df)}")
-    print(f"✓ 缓存已保存到 {cache_file}")
-    
-    return valid_df
-
-
-# 创建数据加载器
-def get_dataloaders(root_dir, csv_file, batch_size=16, val_split=0.2):
-    """
-    创建训练和验证数据加载器
-    """
-    # 先验证并获取有效数据
-    valid_df = validate_dataset(root_dir, csv_file)
-    
-    # 划分训练集和验证集
-    n_val = int(len(valid_df) * val_split)
-    
-    # 使用固定的随机种子，确保每次划分一致
-    np.random.seed(42)
-    indices = np.random.permutation(len(valid_df))
-    
-    train_indices = indices[n_val:]
-    val_indices = indices[:n_val]
-    
-    # 创建训练和验证CSV
-    train_df = valid_df.iloc[train_indices].reset_index(drop=True)
-    val_df = valid_df.iloc[val_indices].reset_index(drop=True)
-    
-    # 保存临时CSV
-    train_df.to_csv('train_split.csv', index=False)
-    val_df.to_csv('val_split.csv', index=False)
-    
-    # 创建数据集
-    train_dataset = Nutrition5kDataset(root_dir, 'train_split.csv', is_train=True)
-    val_dataset = Nutrition5kDataset(root_dir, 'val_split.csv', is_train=False)
-    
-    # 创建数据加载器
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=False
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=False
-    )
-    
-    return train_loader, val_loader
-
-
-# 测试数据集类（用于Kaggle提交）
 class Nutrition5kTestDataset(Dataset):
-    def __init__(self, root_dir):
-        """测试集数据加载器"""
-        self.root_dir = Path(root_dir)
-        base_path = self.root_dir / 'comp-90086-nutrition-5-k' / 'Nutrition5K' / 'Nutrition5K'
+    """Dataset class for Nutrition5k test data (for Kaggle submission)"""
+    
+    def __init__(self):
+        """Initialize test dataset"""
+        # Get all dish IDs from test directory
+        self.dish_ids = sorted([d.name for d in Config.TEST_COLOR_DIR.iterdir() if d.is_dir()])
         
-        self.color_dir = base_path / 'test' / 'color'
-        self.depth_dir = base_path / 'test' / 'depth_raw'
-        
-        # 获取所有dish_id
-        self.dish_ids = sorted([d.name for d in self.color_dir.iterdir() if d.is_dir()])
-        
+        # Define transforms (no augmentation for test)
         self.rgb_transform = transforms.Compose([
-            transforms.Resize((224, 224)),
+            transforms.Resize((Config.IMAGE_SIZE, Config.IMAGE_SIZE)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                               std=[0.229, 0.224, 0.225])
+            transforms.Normalize(mean=Config.RGB_MEAN, std=Config.RGB_STD)
         ])
         
         self.depth_transform = transforms.Compose([
-            transforms.Resize((224, 224)),
+            transforms.Resize((Config.IMAGE_SIZE, Config.IMAGE_SIZE)),
             transforms.ToTensor(),
         ])
     
@@ -217,8 +116,8 @@ class Nutrition5kTestDataset(Dataset):
     def __getitem__(self, idx):
         dish_id = self.dish_ids[idx]
         
-        rgb_path = self.color_dir / dish_id / 'rgb.png'
-        depth_path = self.depth_dir / dish_id / 'depth_raw.png'
+        rgb_path = Config.TEST_COLOR_DIR / dish_id / 'rgb.png'
+        depth_path = Config.TEST_DEPTH_DIR / dish_id / 'depth_raw.png'
         
         rgb_img = Image.open(rgb_path).convert('RGB')
         depth_img = Image.open(depth_path).convert('L')
@@ -230,27 +129,160 @@ class Nutrition5kTestDataset(Dataset):
         return rgb_img, depth_img, dish_id
 
 
-# ============= 使用示例 =============
-if __name__ == '__main__':
-    # 设置路径
-    ROOT_DIR = '/Users/hanlinxuan/Desktop/Learning/Unimelb/2025 S2/CV/Assignment/Project/content'
-    CSV_FILE = '/Users/hanlinxuan/Desktop/Learning/Unimelb/2025 S2/CV/Assignment/Project/content/comp-90086-nutrition-5-k/Nutrition5K/Nutrition5K/nutrition5k_train.csv'
+def validate_dataset():
+    """
+    Validate dataset integrity and return filtered DataFrame
+    Uses cache to avoid re-validation
+    """
+    # Check cache
+    if Config.VALID_DATA_CACHE.exists():
+        print("✓ Loading cached valid data")
+        with open(Config.VALID_DATA_CACHE, 'rb') as f:
+            return pickle.load(f)
     
-    # 创建数据加载器（第一次会检查，之后用缓存）
-    train_loader, val_loader = get_dataloaders(
-        root_dir=ROOT_DIR,
-        csv_file=CSV_FILE,
-        batch_size=16,
-        val_split=0.2
+    print("🔍 Validating dataset integrity...")
+    df = pd.read_csv(Config.TRAIN_CSV)
+    
+    valid_rows = []
+    invalid_count = 0
+    
+    for idx in range(len(df)):
+        dish_id = df.iloc[idx, 0]
+        rgb_path = Config.TRAIN_COLOR_DIR / dish_id / 'rgb.png'
+        depth_path = Config.TRAIN_DEPTH_DIR / dish_id / 'depth_raw.png'
+        
+        try:
+            if rgb_path.exists() and depth_path.exists():
+                Image.open(rgb_path).convert('RGB')
+                Image.open(depth_path)
+                valid_rows.append(df.iloc[idx])
+            else:
+                invalid_count += 1
+        except Exception as e:
+            print(f"  ⚠️  Skipping corrupted sample: {dish_id}")
+            invalid_count += 1
+    
+    # Create valid DataFrame
+    valid_df = pd.DataFrame(valid_rows).reset_index(drop=True)
+    
+    # Save cache
+    with open(Config.VALID_DATA_CACHE, 'wb') as f:
+        pickle.dump(valid_df, f)
+    
+    print(f"✓ Valid samples: {len(valid_df)} / {len(df)}")
+    if invalid_count > 0:
+        print(f"  ⚠️  Skipped {invalid_count} invalid samples")
+    print(f"✓ Cache saved to {Config.VALID_DATA_CACHE}")
+    
+    return valid_df
+
+
+def get_dataloaders(batch_size=None, val_split=None):
+    """
+    Create train and validation data loaders
+    
+    Args:
+        batch_size: Batch size (defaults to Config.BATCH_SIZE)
+        val_split: Validation split ratio (defaults to Config.VAL_SPLIT)
+    
+    Returns:
+        train_loader, val_loader
+    """
+    batch_size = batch_size or Config.BATCH_SIZE
+    val_split = val_split or Config.VAL_SPLIT
+    
+    # Validate and get valid data
+    valid_df = validate_dataset()
+    
+    # Split into train/val
+    n_val = int(len(valid_df) * val_split)
+    
+    # Use fixed random seed for reproducibility
+    np.random.seed(Config.RANDOM_SEED)
+    indices = np.random.permutation(len(valid_df))
+    
+    train_indices = indices[n_val:]
+    val_indices = indices[:n_val]
+    
+    # Create split DataFrames
+    train_df = valid_df.iloc[train_indices].reset_index(drop=True)
+    val_df = valid_df.iloc[val_indices].reset_index(drop=True)
+    
+    # Save split CSVs
+    train_df.to_csv(Config.TRAIN_SPLIT_CSV, index=False)
+    val_df.to_csv(Config.VAL_SPLIT_CSV, index=False)
+    
+    # Create datasets
+    train_dataset = Nutrition5kDataset(Config.TRAIN_SPLIT_CSV, is_train=True)
+    val_dataset = Nutrition5kDataset(Config.VAL_SPLIT_CSV, is_train=False)
+    
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=Config.PIN_MEMORY
     )
     
-    print(f"\n训练集大小: {len(train_loader.dataset)}")
-    print(f"验证集大小: {len(val_loader.dataset)}")
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=Config.PIN_MEMORY
+    )
     
-    # 测试加载一个batch
+    return train_loader, val_loader
+
+
+def get_test_loader(batch_size=None):
+    """
+    Create test data loader
+    
+    Args:
+        batch_size: Batch size (defaults to Config.BATCH_SIZE)
+    
+    Returns:
+        test_loader
+    """
+    batch_size = batch_size or Config.BATCH_SIZE
+    
+    test_dataset = Nutrition5kTestDataset()
+    
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=Config.PIN_MEMORY
+    )
+    
+    return test_loader
+
+
+# ============= Usage Example =============
+if __name__ == '__main__':
+    # Validate configuration
+    Config.validate_paths()
+    Config.create_directories()
+    Config.print_config()
+    
+    # Create data loaders
+    print("\n📦 Loading data...")
+    train_loader, val_loader = get_dataloaders()
+    
+    print(f"\n✓ Training samples:   {len(train_loader.dataset)}")
+    print(f"✓ Validation samples: {len(val_loader.dataset)}")
+    print(f"✓ Train batches:      {len(train_loader)}")
+    print(f"✓ Val batches:        {len(val_loader)}")
+    
+    # Test loading a batch
+    print("\n🧪 Testing batch loading...")
     rgb, depth, calories = next(iter(train_loader))
-    print(f"\nRGB shape: {rgb.shape}")
-    print(f"Depth shape: {depth.shape}")
-    print(f"Calories shape: {calories.shape}")
+    print(f"✓ RGB shape:     {rgb.shape}")
+    print(f"✓ Depth shape:   {depth.shape}")
+    print(f"✓ Calories shape: {calories.shape}")
+    print(f"✓ Calorie range: [{calories.min():.1f}, {calories.max():.1f}]")
     
-    print("\n✅ 数据预处理完成！")
+    print("\n✅ Data loading successful!")
