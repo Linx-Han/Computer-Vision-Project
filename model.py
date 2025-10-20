@@ -89,6 +89,58 @@ class CalorieEstimatorCNN(nn.Module):
         
         return calories
 
+class AttentionFusionCNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+        # Same RGB and depth streams as original
+        self.rgb_stream = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128), nn.ReLU(), nn.AdaptiveAvgPool2d((1, 1))
+        )
+        
+        self.depth_stream = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128), nn.ReLU(), nn.AdaptiveAvgPool2d((1, 1))
+        )
+        
+        # Attention mechanism
+        self.attention = nn.Sequential(
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2),
+            nn.Softmax(dim=1)
+        )
+        
+        # Regression head
+        self.regressor = nn.Sequential(
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Dropout(Config.DROPOUT_RATE),
+            nn.Linear(128, 1)
+        )
+    
+    def forward(self, rgb, depth):
+        rgb_feat = self.rgb_stream(rgb).flatten(1)
+        depth_feat = self.depth_stream(depth).flatten(1)
+        
+        # Learn attention weights
+        concat = torch.cat([rgb_feat, depth_feat], dim=1)
+        weights = self.attention(concat)  # [batch, 2]
+        
+        # Weighted fusion
+        fused = weights[:, 0:1] * rgb_feat + weights[:, 1:2] * depth_feat
+        
+        return self.regressor(fused).squeeze(1)
+
 
 class Trainer:
     """Trainer class to handle training and validation"""
@@ -368,7 +420,7 @@ def main():
     
     # Create model
     print("\n🏗️  Creating model...")
-    model = CalorieEstimatorCNN().to(device)
+    model = AttentionFusionCNN().to(device)
     
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
