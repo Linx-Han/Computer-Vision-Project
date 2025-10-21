@@ -1,5 +1,6 @@
 """
 Model definition and training for Nutrition5k calorie estimation
+Uses Inception-ResNet architecture with 5-channel input
 """
 import torch
 import torch.nn as nn
@@ -12,134 +13,377 @@ from config import Config
 from data import get_dataloaders
 
 
-class CalorieEstimatorCNN(nn.Module):
-    """Dual-stream CNN: processes RGB and Depth separately, then fuses"""
+class InceptionModule(nn.Module):
+    """Inception module with multiple kernel sizes"""
     
-    def __init__(self):
-        super(CalorieEstimatorCNN, self).__init__()
+    def __init__(self, in_channels, out_1x1, reduce_3x3, out_3x3, reduce_5x5, out_5x5, out_pool):
+        super(InceptionModule, self).__init__()
         
-        # RGB stream - 3 convolutional layers
-        self.rgb_stream = nn.Sequential(
-            # Conv1: 3 -> 32
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(2),  # 224 -> 112
-            
-            # Conv2: 32 -> 64
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),  # 112 -> 56
-            
-            # Conv3: 64 -> 128
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1))  # Global average pooling
+        # 1x1 convolution branch
+        self.branch1 = nn.Sequential(
+            nn.Conv2d(in_channels, out_1x1, kernel_size=1),
+            nn.BatchNorm2d(out_1x1),
+            nn.ReLU(inplace=True)
         )
         
-        # Depth stream - 3 convolutional layers
-        self.depth_stream = nn.Sequential(
-            # Conv1: 1 -> 32
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            
-            # Conv2: 32 -> 64
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            
-            # Conv3: 64 -> 128
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1))
+        # 3x3 convolution branch
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(in_channels, reduce_3x3, kernel_size=1),
+            nn.BatchNorm2d(reduce_3x3),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(reduce_3x3, out_3x3, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_3x3),
+            nn.ReLU(inplace=True)
         )
         
-        # Fusion layer + regression head
-        self.fusion = nn.Sequential(
-            nn.Linear(256, 128),  # 128 (RGB) + 128 (Depth) = 256
-            nn.ReLU(),
-            nn.Dropout(Config.DROPOUT_RATE),
-            nn.Linear(128, 1)
+        # 5x5 convolution branch (using two 3x3 for efficiency)
+        self.branch3 = nn.Sequential(
+            nn.Conv2d(in_channels, reduce_5x5, kernel_size=1),
+            nn.BatchNorm2d(reduce_5x5),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(reduce_5x5, out_5x5, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_5x5),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_5x5, out_5x5, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_5x5),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Max pooling branch
+        self.branch4 = nn.Sequential(
+            nn.MaxPool2d(kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(in_channels, out_pool, kernel_size=1),
+            nn.BatchNorm2d(out_pool),
+            nn.ReLU(inplace=True)
         )
     
-    def forward(self, rgb, depth):
+    def forward(self, x):
+        branch1 = self.branch1(x)
+        branch2 = self.branch2(x)
+        branch3 = self.branch3(x)
+        branch4 = self.branch4(x)
+        
+        return torch.cat([branch1, branch2, branch3, branch4], dim=1)
+
+
+class ResidualBlock(nn.Module):
+    """Residual block with skip connection"""
+    
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(ResidualBlock, self).__init__()
+        
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, 
+                               stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3,
+                               stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        
+        # Skip connection
+        self.skip = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.skip = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, 
+                         stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+    
+    def forward(self, x):
+        identity = self.skip(x)
+        
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        
+        out = self.conv2(out)
+        out = self.bn2(out)
+        
+        out += identity
+        out = self.relu(out)
+        
+        return out
+
+
+class InceptionResNetV2(nn.Module):
+    """
+    Inception-ResNet architecture for 5-channel input
+    Combines Inception modules with ResNet skip connections
+    """
+    
+    def __init__(self, num_classes=1, dropout_rate=0.5):
+        super(InceptionResNetV2, self).__init__()
+        
+        # Stem: Initial convolutions to process 5-channel input
+        self.stem = nn.Sequential(
+            nn.Conv2d(5, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            
+            nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            
+            nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        )
+        
+        # Inception-ResNet-A blocks (3 blocks)
+        self.inception_resnet_a1 = self._make_inception_resnet_a(64, scale=0.17)
+        self.inception_resnet_a2 = self._make_inception_resnet_a(256, scale=0.17)
+        self.inception_resnet_a3 = self._make_inception_resnet_a(256, scale=0.17)
+        
+        # Reduction-A
+        self.reduction_a = nn.Sequential(
+            nn.Conv2d(256, 384, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(384),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Inception-ResNet-B blocks (3 blocks)
+        self.inception_resnet_b1 = self._make_inception_resnet_b(384, scale=0.10)
+        self.inception_resnet_b2 = self._make_inception_resnet_b(896, scale=0.10)
+        self.inception_resnet_b3 = self._make_inception_resnet_b(896, scale=0.10)
+        
+        # Global Average Pooling
+        self.global_avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # Regression head
+        self.regressor = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(896, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate / 2),
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, num_classes)
+        )
+    
+    def _make_inception_resnet_a(self, in_channels, scale=1.0):
+
+    
+        # Branch 1: 1x1 conv
+        branch1 = nn.Conv2d(in_channels, 32, kernel_size=1, padding=0)
+        
+        # Branch 2: 1x1 -> 3x3
+        branch2 = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=1, padding=0),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1)
+        )
+        
+        # Branch 3: 1x1 -> 3x3 -> 3x3
+        branch3 = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=1, padding=0),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 48, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(48, 64, kernel_size=3, padding=1)
+        )
+        
+        # Concatenate: 32 + 32 + 64 = 128
+        conv_out_channels = 128
+        
+        # 1x1 conv to match input channels
+        up = nn.Conv2d(conv_out_channels, in_channels if in_channels != 64 else 256, 
+                    kernel_size=1, padding=0)
+        
+        # Combine into module
+        class InceptionResNetA(nn.Module):
+            def __init__(self, b1, b2, b3, up_conv, scale, in_ch):
+                super().__init__()
+                self.branch1 = b1
+                self.branch2 = b2
+                self.branch3 = b3
+                self.up = up_conv
+                self.scale = scale
+                self.relu = nn.ReLU(inplace=True)
+                
+                # Adjust input if needed
+                self.need_adjust = (in_ch == 64)
+                if self.need_adjust:
+                    self.adjust = nn.Conv2d(64, 256, kernel_size=1)
+            
+            def forward(self, x):
+                identity = self.adjust(x) if self.need_adjust else x
+                
+                b1 = self.branch1(x)
+                b2 = self.branch2(x)
+                b3 = self.branch3(x)
+                
+                mixed = torch.cat([b1, b2, b3], dim=1)
+                up = self.up(mixed)
+                
+                out = identity + self.scale * up
+                out = self.relu(out)
+                
+                return out
+        
+        return InceptionResNetA(branch1, branch2, branch3, up, scale, in_channels)
+        
+    def _make_inception_resnet_b(self, in_channels, scale=1.0):
+        """Create Inception-ResNet-B block"""
+        
+        # Branch 1: 1x1 conv
+        branch1 = nn.Conv2d(in_channels, 192, kernel_size=1, padding=0)
+        
+        # Branch 2: 1x1 -> 1x7 -> 7x1
+        branch2 = nn.Sequential(
+            nn.Conv2d(in_channels, 128, kernel_size=1, padding=0),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 160, kernel_size=(1, 7), padding=(0, 3)),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(160, 192, kernel_size=(7, 1), padding=(3, 0))
+        )
+        
+        # Concatenate: 192 + 192 = 384
+        conv_out_channels = 384
+        
+        # 1x1 conv to match input channels
+        up = nn.Conv2d(conv_out_channels, in_channels if in_channels != 384 else 896,
+                    kernel_size=1, padding=0)
+        
+        class InceptionResNetB(nn.Module):
+            def __init__(self, b1, b2, up_conv, scale, in_ch):
+                super().__init__()
+                self.branch1 = b1
+                self.branch2 = b2
+                self.up = up_conv
+                self.scale = scale
+                self.relu = nn.ReLU(inplace=True)
+                
+                # Adjust input if needed
+                self.need_adjust = (in_ch == 384)
+                if self.need_adjust:
+                    self.adjust = nn.Conv2d(384, 896, kernel_size=1)
+            
+            def forward(self, x):
+                identity = self.adjust(x) if self.need_adjust else x
+                
+                b1 = self.branch1(x)
+                b2 = self.branch2(x)
+                
+                mixed = torch.cat([b1, b2], dim=1)
+                up = self.up(mixed)
+                
+                out = identity + self.scale * up
+                out = self.relu(out)
+                
+                return out
+        
+        return InceptionResNetB(branch1, branch2, up, scale, in_channels)
+    
+    def forward(self, x):
         """
         Args:
-            rgb: RGB images [batch, 3, 224, 224]
-            depth: Depth images [batch, 1, 224, 224]
+            x: 5-channel input [batch, 5, H, W]
         
         Returns:
             calories: Predicted calories [batch]
         """
-        # Extract features
-        rgb_feat = self.rgb_stream(rgb).flatten(1)      # [batch, 128]
-        depth_feat = self.depth_stream(depth).flatten(1) # [batch, 128]
+        # Stem
+        x = self.stem(x)
         
-        # Fuse features
-        fused = torch.cat([rgb_feat, depth_feat], dim=1) # [batch, 256]
+        # Inception-ResNet-A blocks
+        x = self.inception_resnet_a1(x)
+        x = self.inception_resnet_a2(x)
+        x = self.inception_resnet_a3(x)
         
-        # Regress to calories
-        calories = self.fusion(fused).squeeze(1)         # [batch]
+        # Reduction-A
+        x = self.reduction_a(x)
         
-        return calories
+        # Inception-ResNet-B blocks
+        x = self.inception_resnet_b1(x)
+        x = self.inception_resnet_b2(x)
+        x = self.inception_resnet_b3(x)
+        
+        # Global pooling
+        x = self.global_avg_pool(x)
+        x = x.flatten(1)
+        
+        # Regression
+        x = self.regressor(x)
+        
+        return x.squeeze(1)
 
-class AttentionFusionCNN(nn.Module):
-    def __init__(self):
-        super().__init__()
+
+class SimpleInceptionResNet(nn.Module):
+    """
+    Simplified Inception-ResNet for faster training
+    Good balance between performance and efficiency
+    """
+    
+    def __init__(self, dropout_rate=0.5):
+        super(SimpleInceptionResNet, self).__init__()
         
-        # Same RGB and depth streams as original
-        self.rgb_stream = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128), nn.ReLU(), nn.AdaptiveAvgPool2d((1, 1))
+        # Initial convolution for 5 channels
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(5, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         )
         
-        self.depth_stream = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128), nn.ReLU(), nn.AdaptiveAvgPool2d((1, 1))
+        # Inception module 1
+        self.inception1 = InceptionModule(64, 64, 96, 128, 16, 32, 32)  # Output: 256
+        
+        # Residual blocks 1
+        self.res1 = ResidualBlock(256, 256)
+        self.res2 = ResidualBlock(256, 256)
+        
+        # Downsample
+        self.downsample1 = nn.Sequential(
+            nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True)
         )
         
-        # Attention mechanism
-        self.attention = nn.Sequential(
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Linear(64, 2),
-            nn.Softmax(dim=1)
-        )
+        # Inception module 2
+        self.inception2 = InceptionModule(512, 128, 128, 192, 32, 96, 64)  # Output: 480
+        
+        # Residual blocks 2
+        self.res3 = ResidualBlock(480, 512, stride=2)
+        self.res4 = ResidualBlock(512, 512)
+        
+        # Global average pooling
+        self.global_avg_pool = nn.AdaptiveAvgPool2d((1, 1))
         
         # Regression head
         self.regressor = nn.Sequential(
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Dropout(Config.DROPOUT_RATE),
+            nn.Dropout(dropout_rate),
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate / 2),
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
             nn.Linear(128, 1)
         )
     
-    def forward(self, rgb, depth):
-        rgb_feat = self.rgb_stream(rgb).flatten(1)
-        depth_feat = self.depth_stream(depth).flatten(1)
+    def forward(self, x):
+        """
+        Args:
+            x: 5-channel input [batch, 5, H, W]
         
-        # Learn attention weights
-        concat = torch.cat([rgb_feat, depth_feat], dim=1)
-        weights = self.attention(concat)  # [batch, 2]
+        Returns:
+            calories: Predicted calories [batch]
+        """
+        x = self.conv1(x)
+        x = self.inception1(x)
+        x = self.res1(x)
+        x = self.res2(x)
+        x = self.downsample1(x)
+        x = self.inception2(x)
+        x = self.res3(x)
+        x = self.res4(x)
         
-        # Weighted fusion
-        fused = weights[:, 0:1] * rgb_feat + weights[:, 1:2] * depth_feat
+        x = self.global_avg_pool(x)
+        x = x.flatten(1)
+        x = self.regressor(x)
         
-        return self.regressor(fused).squeeze(1)
+        return x.squeeze(1)
 
 
 class Trainer:
@@ -185,13 +429,12 @@ class Trainer:
         self.model.train()
         total_loss = 0
         
-        for rgb, depth, calories in tqdm(self.train_loader, desc='Training'):
-            rgb = rgb.to(self.device)
-            depth = depth.to(self.device)
+        for combined, calories in tqdm(self.train_loader, desc='Training'):
+            combined = combined.to(self.device)  # 5-channel input
             calories = calories.to(self.device)
             
             # Forward pass
-            pred_calories = self.model(rgb, depth)
+            pred_calories = self.model(combined)
             loss = self.criterion(pred_calories, calories)
             
             # Backward pass
@@ -210,12 +453,11 @@ class Trainer:
         total_loss = 0
         
         with torch.no_grad():
-            for rgb, depth, calories in tqdm(self.val_loader, desc='Validation'):
-                rgb = rgb.to(self.device)
-                depth = depth.to(self.device)
+            for combined, calories in tqdm(self.val_loader, desc='Validation'):
+                combined = combined.to(self.device)  # 5-channel input
                 calories = calories.to(self.device)
                 
-                pred_calories = self.model(rgb, depth)
+                pred_calories = self.model(combined)
                 loss = self.criterion(pred_calories, calories)
                 
                 total_loss += loss.item()
@@ -412,21 +654,38 @@ def main():
     # Get device
     device = get_device()
     
-    # Load data
-    print("\n📦 Loading data...")
-    train_loader, val_loader = get_dataloaders()
+    # Load data with 5-channel output
+    print("\n📦 Loading data with 5-channel tensors...")
+    train_loader, val_loader = get_dataloaders(
+        use_relative_depth=True,
+        depth_method='percentile',
+        plate_percentile=10
+    )
     print(f"✓ Training samples:   {len(train_loader.dataset)}")
     print(f"✓ Validation samples: {len(val_loader.dataset)}")
     
+    # Test data shape
+    sample_batch, sample_calories = next(iter(train_loader))
+    print(f"✓ Input shape: {sample_batch.shape}")  # Should be (batch, 5, H, W)
+    print(f"  - Channels: RGB(3) + Depth(1) + Height(1) = 5")
+    
     # Create model
-    print("\n🏗️  Creating model...")
-    model = AttentionFusionCNN().to(device)
+    print("\n🏗️  Creating Inception-ResNet model...")
+    
+    # Choose model architecture
+    model = InceptionResNetV2(dropout_rate=Config.DROPOUT_RATE).to(device)  # Full version
+    # model = SimpleInceptionResNet(dropout_rate=Config.DROPOUT_RATE).to(device)  # Simpler version (recommended)
     
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"✓ Total parameters:     {total_params:,}")
     print(f"✓ Trainable parameters: {trainable_params:,}")
+    
+    # Test forward pass
+    with torch.no_grad():
+        test_output = model(sample_batch[:2].to(device))
+        print(f"✓ Output shape: {test_output.shape}")  # Should be (2,)
     
     # Create trainer
     trainer = Trainer(model, train_loader, val_loader, device)
