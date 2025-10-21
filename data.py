@@ -1,5 +1,5 @@
 """
-Data loading and preprocessing for Nutrition5k dataset
+Data loading and preprocessing for Nutrition5k dataset with surface normals
 """
 import pickle
 import numpy as np
@@ -13,8 +13,39 @@ from pathlib import Path
 from config import Config
 
 
+def compute_surface_normals(depth_array):
+    """
+    Compute surface normals from depth map using numpy gradients
+    
+    Args:
+        depth_array: numpy array of shape (H, W) containing depth values
+        
+    Returns:
+        normals: numpy array of shape (H, W, 3) containing normalized surface normals
+    """
+    # Compute gradients (derivatives in x and y directions)
+    zy, zx = np.gradient(depth_array)
+    
+    # Surface normal is the cross product of tangent vectors
+    # Tangent in x: [1, 0, zx]
+    # Tangent in y: [0, 1, zy]
+    # Normal: [-zx, -zy, 1]
+    normal_x = -zx
+    normal_y = -zy
+    normal_z = np.ones_like(depth_array)
+    
+    # Stack to create (H, W, 3)
+    normals = np.stack([normal_x, normal_y, normal_z], axis=-1)
+    
+    # Normalize to unit vectors
+    norm = np.linalg.norm(normals, axis=-1, keepdims=True)
+    normals = normals / (norm + 1e-8)
+    
+    return normals
+
+
 class Nutrition5kDataset(Dataset):
-    """Dataset class for Nutrition5k training/validation data"""
+    """Dataset class for Nutrition5k training/validation data with surface normals"""
     
     def __init__(self, csv_file, is_train=True):
         """
@@ -28,6 +59,7 @@ class Nutrition5kDataset(Dataset):
         # Define transforms
         self.rgb_transform = self._get_rgb_transform(is_train)
         self.depth_transform = self._get_depth_transform()
+        self.normals_transform = self._get_normals_transform()
     
     def _get_rgb_transform(self, is_train):
         """Get RGB image transforms"""
@@ -57,6 +89,13 @@ class Nutrition5kDataset(Dataset):
             transforms.ToTensor(),
         ])
     
+    def _get_normals_transform(self):
+        """Get surface normals transforms"""
+        return transforms.Compose([
+            transforms.Resize((Config.IMAGE_SIZE, Config.IMAGE_SIZE)),
+            transforms.ToTensor(),
+        ])
+    
     def __len__(self):
         return len(self.df)
     
@@ -75,23 +114,38 @@ class Nutrition5kDataset(Dataset):
             rgb_img = Image.open(rgb_path).convert('RGB')
             depth_img = Image.open(depth_path).convert('L')
             
+            # Convert depth to numpy for normal calculation
+            depth_array = np.array(depth_img, dtype=np.float32)
+            
+            # Compute surface normals from depth
+            normals_array = compute_surface_normals(depth_array)  # (H, W, 3)
+            
+            # Convert normals to PIL Image for transforms
+            # Scale from [-1, 1] to [0, 255] for PIL
+            normals_uint8 = ((normals_array + 1) * 127.5).astype(np.uint8)
+            normals_img = Image.fromarray(normals_uint8)
+            
             # Apply transforms
             rgb_img = self.rgb_transform(rgb_img)
             depth_img = self.depth_transform(depth_img)
+            normals_img = self.normals_transform(normals_img)
             
             # Normalize depth to [0, 1]
             depth_img = (depth_img - depth_img.min()) / (depth_img.max() - depth_img.min() + 1e-8)
             
-            return rgb_img, depth_img, torch.tensor(calories, dtype=torch.float32)
+            # Scale normals back to [-1, 1]
+            normals_img = (normals_img - 0.5) * 2
+            
+            return rgb_img, depth_img, normals_img, torch.tensor(calories, dtype=torch.float32)
         
         except Exception as e:
-            print(f"\n⚠️  Error loading {dish_id}: {str(e)}")
+            print(f"\n⚠️ Error loading {dish_id}: {str(e)}")
             # Return next sample on error
             return self.__getitem__((idx + 1) % len(self))
 
 
 class Nutrition5kTestDataset(Dataset):
-    """Dataset class for Nutrition5k test data (for Kaggle submission)"""
+    """Dataset class for Nutrition5k test data with surface normals"""
     
     def __init__(self):
         """Initialize test dataset"""
@@ -109,6 +163,11 @@ class Nutrition5kTestDataset(Dataset):
             transforms.Resize((Config.IMAGE_SIZE, Config.IMAGE_SIZE)),
             transforms.ToTensor(),
         ])
+        
+        self.normals_transform = transforms.Compose([
+            transforms.Resize((Config.IMAGE_SIZE, Config.IMAGE_SIZE)),
+            transforms.ToTensor(),
+        ])
     
     def __len__(self):
         return len(self.dish_ids)
@@ -122,11 +181,22 @@ class Nutrition5kTestDataset(Dataset):
         rgb_img = Image.open(rgb_path).convert('RGB')
         depth_img = Image.open(depth_path).convert('L')
         
+        # Compute surface normals
+        depth_array = np.array(depth_img, dtype=np.float32)
+        normals_array = compute_surface_normals(depth_array)
+        normals_uint8 = ((normals_array + 1) * 127.5).astype(np.uint8)
+        normals_img = Image.fromarray(normals_uint8)
+        
+        # Apply transforms
         rgb_img = self.rgb_transform(rgb_img)
         depth_img = self.depth_transform(depth_img)
-        depth_img = (depth_img - depth_img.min()) / (depth_img.max() - depth_img.min() + 1e-8)
+        normals_img = self.normals_transform(normals_img)
         
-        return rgb_img, depth_img, dish_id
+        # Normalize
+        depth_img = (depth_img - depth_img.min()) / (depth_img.max() - depth_img.min() + 1e-8)
+        normals_img = (normals_img - 0.5) * 2
+        
+        return rgb_img, depth_img, normals_img, dish_id
 
 
 def validate_dataset():
@@ -159,7 +229,7 @@ def validate_dataset():
             else:
                 invalid_count += 1
         except Exception as e:
-            print(f"  ⚠️  Skipping corrupted sample: {dish_id}")
+            print(f"  ⚠️ Skipping corrupted sample: {dish_id}")
             invalid_count += 1
     
     # Create valid DataFrame
@@ -171,7 +241,7 @@ def validate_dataset():
     
     print(f"✓ Valid samples: {len(valid_df)} / {len(df)}")
     if invalid_count > 0:
-        print(f"  ⚠️  Skipped {invalid_count} invalid samples")
+        print(f"  ⚠️ Skipped {invalid_count} invalid samples")
     print(f"✓ Cache saved to {Config.VALID_DATA_CACHE}")
     
     return valid_df
@@ -279,10 +349,12 @@ if __name__ == '__main__':
     
     # Test loading a batch
     print("\n🧪 Testing batch loading...")
-    rgb, depth, calories = next(iter(train_loader))
+    rgb, depth, normals, calories = next(iter(train_loader))
     print(f"✓ RGB shape:     {rgb.shape}")
     print(f"✓ Depth shape:   {depth.shape}")
+    print(f"✓ Normals shape: {normals.shape}")
     print(f"✓ Calories shape: {calories.shape}")
     print(f"✓ Calorie range: [{calories.min():.1f}, {calories.max():.1f}]")
+    print(f"✓ Normals range: [{normals.min():.3f}, {normals.max():.3f}]")
     
     print("\n✅ Data loading successful!")

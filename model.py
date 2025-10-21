@@ -1,5 +1,5 @@
 """
-Model definition and training for Nutrition5k calorie estimation
+Model definition and training for Nutrition5k calorie estimation with surface normals
 """
 import torch
 import torch.nn as nn
@@ -13,7 +13,7 @@ from data import get_dataloaders
 
 
 class CalorieEstimatorCNN(nn.Module):
-    """Dual-stream CNN: processes RGB and Depth separately, then fuses"""
+    """Triple-stream CNN: processes RGB, Depth, and Surface Normals separately, then fuses"""
     
     def __init__(self):
         super(CalorieEstimatorCNN, self).__init__()
@@ -60,40 +60,69 @@ class CalorieEstimatorCNN(nn.Module):
             nn.AdaptiveAvgPool2d((1, 1))
         )
         
+        # Surface normals stream - 3 convolutional layers
+        self.normals_stream = nn.Sequential(
+            # Conv1: 3 -> 32 (normals have 3 channels: nx, ny, nz)
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            
+            # Conv2: 32 -> 64
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            
+            # Conv3: 64 -> 128
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1))
+        )
+        
         # Fusion layer + regression head
         self.fusion = nn.Sequential(
-            nn.Linear(256, 128),  # 128 (RGB) + 128 (Depth) = 256
+            nn.Linear(384, 256),  # 128 (RGB) + 128 (Depth) + 128 (Normals) = 384
+            nn.ReLU(),
+            nn.Dropout(Config.DROPOUT_RATE),
+            nn.Linear(256, 128),
             nn.ReLU(),
             nn.Dropout(Config.DROPOUT_RATE),
             nn.Linear(128, 1)
         )
     
-    def forward(self, rgb, depth):
+    def forward(self, rgb, depth, normals):
         """
         Args:
             rgb: RGB images [batch, 3, 224, 224]
             depth: Depth images [batch, 1, 224, 224]
+            normals: Surface normals [batch, 3, 224, 224]
         
         Returns:
             calories: Predicted calories [batch]
         """
         # Extract features
-        rgb_feat = self.rgb_stream(rgb).flatten(1)      # [batch, 128]
-        depth_feat = self.depth_stream(depth).flatten(1) # [batch, 128]
+        rgb_feat = self.rgb_stream(rgb).flatten(1)          # [batch, 128]
+        depth_feat = self.depth_stream(depth).flatten(1)    # [batch, 128]
+        normals_feat = self.normals_stream(normals).flatten(1)  # [batch, 128]
         
         # Fuse features
-        fused = torch.cat([rgb_feat, depth_feat], dim=1) # [batch, 256]
+        fused = torch.cat([rgb_feat, depth_feat, normals_feat], dim=1)  # [batch, 384]
         
         # Regress to calories
-        calories = self.fusion(fused).squeeze(1)         # [batch]
+        calories = self.fusion(fused).squeeze(1)  # [batch]
         
         return calories
 
+
 class AttentionFusionCNN(nn.Module):
+    """Triple-stream CNN with attention-based fusion"""
+    
     def __init__(self):
         super().__init__()
         
-        # Same RGB and depth streams as original
+        # Same RGB, depth, and normals streams as original
         self.rgb_stream = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
@@ -112,11 +141,20 @@ class AttentionFusionCNN(nn.Module):
             nn.BatchNorm2d(128), nn.ReLU(), nn.AdaptiveAvgPool2d((1, 1))
         )
         
-        # Attention mechanism
+        self.normals_stream = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128), nn.ReLU(), nn.AdaptiveAvgPool2d((1, 1))
+        )
+        
+        # Attention mechanism for 3 streams
         self.attention = nn.Sequential(
-            nn.Linear(256, 64),
+            nn.Linear(384, 128),  # 128 * 3 = 384
             nn.ReLU(),
-            nn.Linear(64, 2),
+            nn.Linear(128, 3),
             nn.Softmax(dim=1)
         )
         
@@ -128,16 +166,19 @@ class AttentionFusionCNN(nn.Module):
             nn.Linear(128, 1)
         )
     
-    def forward(self, rgb, depth):
+    def forward(self, rgb, depth, normals):
         rgb_feat = self.rgb_stream(rgb).flatten(1)
         depth_feat = self.depth_stream(depth).flatten(1)
+        normals_feat = self.normals_stream(normals).flatten(1)
         
-        # Learn attention weights
-        concat = torch.cat([rgb_feat, depth_feat], dim=1)
-        weights = self.attention(concat)  # [batch, 2]
+        # Learn attention weights for 3 streams
+        concat = torch.cat([rgb_feat, depth_feat, normals_feat], dim=1)
+        weights = self.attention(concat)  # [batch, 3]
         
         # Weighted fusion
-        fused = weights[:, 0:1] * rgb_feat + weights[:, 1:2] * depth_feat
+        fused = (weights[:, 0:1] * rgb_feat + 
+                 weights[:, 1:2] * depth_feat + 
+                 weights[:, 2:3] * normals_feat)
         
         return self.regressor(fused).squeeze(1)
 
@@ -185,13 +226,14 @@ class Trainer:
         self.model.train()
         total_loss = 0
         
-        for rgb, depth, calories in tqdm(self.train_loader, desc='Training'):
+        for rgb, depth, normals, calories in tqdm(self.train_loader, desc='Training'):
             rgb = rgb.to(self.device)
             depth = depth.to(self.device)
+            normals = normals.to(self.device)
             calories = calories.to(self.device)
             
             # Forward pass
-            pred_calories = self.model(rgb, depth)
+            pred_calories = self.model(rgb, depth, normals)
             loss = self.criterion(pred_calories, calories)
             
             # Backward pass
@@ -210,12 +252,13 @@ class Trainer:
         total_loss = 0
         
         with torch.no_grad():
-            for rgb, depth, calories in tqdm(self.val_loader, desc='Validation'):
+            for rgb, depth, normals, calories in tqdm(self.val_loader, desc='Validation'):
                 rgb = rgb.to(self.device)
                 depth = depth.to(self.device)
+                normals = normals.to(self.device)
                 calories = calories.to(self.device)
                 
-                pred_calories = self.model(rgb, depth)
+                pred_calories = self.model(rgb, depth, normals)
                 loss = self.criterion(pred_calories, calories)
                 
                 total_loss += loss.item()
@@ -266,7 +309,7 @@ class Trainer:
             
             # Check if learning rate changed
             if new_lr < old_lr:
-                print(f"⚠️  Learning rate reduced: {old_lr:.6f} -> {new_lr:.6f}")
+                print(f"⚠️ Learning rate reduced: {old_lr:.6f} -> {new_lr:.6f}")
             
             # Save best model
             if val_loss < self.best_val_loss:
@@ -277,7 +320,7 @@ class Trainer:
             else:
                 self.patience_counter += 1
                 if self.patience_counter >= Config.EARLY_STOP_PATIENCE:
-                    print(f"\n⚠️  Early stopping triggered after {Config.EARLY_STOP_PATIENCE} epochs without improvement")
+                    print(f"\n⚠️ Early stopping triggered after {Config.EARLY_STOP_PATIENCE} epochs without improvement")
                     break
             
             print()
@@ -397,7 +440,7 @@ def get_device():
         print("✅ Using NVIDIA GPU (CUDA)")
     else:
         device = torch.device("cpu")
-        print("⚠️  Using CPU")
+        print("⚠️ Using CPU")
     
     return device
 
@@ -419,7 +462,7 @@ def main():
     print(f"✓ Validation samples: {len(val_loader.dataset)}")
     
     # Create model
-    print("\n🏗️  Creating model...")
+    print("\n🏗️ Creating model...")
     model = AttentionFusionCNN().to(device)
     
     # Count parameters
