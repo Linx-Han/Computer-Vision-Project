@@ -1,5 +1,6 @@
 """
 Data loading and preprocessing for Nutrition5k dataset
+Uses height-based depth processing with masking
 """
 import pickle
 import numpy as np
@@ -11,10 +12,15 @@ from PIL import Image
 from pathlib import Path
 
 from config import Config
+from preprocess_height import (
+    check_cache_exists,
+    load_cached_height_and_mask,
+    preprocess_single_dish
+)
 
 
 class Nutrition5kDataset(Dataset):
-    """Dataset class for Nutrition5k training/validation data"""
+    """Dataset class for Nutrition5k training/validation data with height processing"""
     
     def __init__(self, csv_file, is_train=True):
         """
@@ -27,7 +33,7 @@ class Nutrition5kDataset(Dataset):
         
         # Define transforms
         self.rgb_transform = self._get_rgb_transform(is_train)
-        self.depth_transform = self._get_depth_transform()
+        self.height_transform = self._get_height_transform()
     
     def _get_rgb_transform(self, is_train):
         """Get RGB image transforms"""
@@ -50,8 +56,8 @@ class Nutrition5kDataset(Dataset):
                 transforms.Normalize(mean=Config.RGB_MEAN, std=Config.RGB_STD)
             ])
     
-    def _get_depth_transform(self):
-        """Get depth image transforms"""
+    def _get_height_transform(self):
+        """Get height image transforms (same for train/val)"""
         return transforms.Compose([
             transforms.Resize((Config.IMAGE_SIZE, Config.IMAGE_SIZE)),
             transforms.ToTensor(),
@@ -67,22 +73,46 @@ class Nutrition5kDataset(Dataset):
             dish_id = row.iloc[0]
             calories = row.iloc[1]
             
-            # Build image paths
-            rgb_path = Config.TRAIN_COLOR_DIR / dish_id / 'rgb.png'
-            depth_path = Config.TRAIN_DEPTH_DIR / dish_id / 'depth_raw.png'
+            # Check if cached height and mask exist
+            if not check_cache_exists(dish_id, Config.TRAIN_HEIGHT_CACHE, Config.TRAIN_MASK_CACHE):
+                # Generate on-the-fly if cache doesn't exist
+                preprocess_single_dish(
+                    dish_id,
+                    Config.TRAIN_DEPTH_DIR,
+                    Config.TRAIN_HEIGHT_CACHE,
+                    Config.TRAIN_MASK_CACHE
+                )
             
-            # Load images
+            # Load cached height map and mask
+            height_cm, food_mask = load_cached_height_and_mask(
+                dish_id,
+                Config.TRAIN_HEIGHT_CACHE,
+                Config.TRAIN_MASK_CACHE
+            )
+            
+            # Load RGB image
+            rgb_path = Config.TRAIN_COLOR_DIR / dish_id / 'rgb.png'
             rgb_img = Image.open(rgb_path).convert('RGB')
-            depth_img = Image.open(depth_path).convert('L')
+            rgb_np = np.array(rgb_img)
+            
+            # Apply mask to RGB (zero out non-food regions)
+            rgb_masked = rgb_np * food_mask[:, :, np.newaxis]
+            rgb_img_masked = Image.fromarray(rgb_masked.astype(np.uint8))
+            
+            # Apply mask to height (zero out non-food regions)
+            height_masked = height_cm * food_mask
+            height_img = Image.fromarray(height_masked.astype(np.float32))
             
             # Apply transforms
-            rgb_img = self.rgb_transform(rgb_img)
-            depth_img = self.depth_transform(depth_img)
+            rgb_tensor = self.rgb_transform(rgb_img_masked)
+            height_tensor = self.height_transform(height_img)
             
-            # Normalize depth to [0, 1]
-            depth_img = (depth_img - depth_img.min()) / (depth_img.max() - depth_img.min() + 1e-8)
+            # Normalize height to [0, 1] for better neural network training
+            height_max = height_tensor.max()
+            if height_max > 0:
+                height_tensor = height_tensor / height_max
             
-            return rgb_img, depth_img, torch.tensor(calories, dtype=torch.float32)
+            return rgb_tensor, height_tensor, torch.tensor(calories, dtype=torch.float32)
         
         except Exception as e:
             print(f"\n⚠️  Error loading {dish_id}: {str(e)}")
@@ -91,7 +121,7 @@ class Nutrition5kDataset(Dataset):
 
 
 class Nutrition5kTestDataset(Dataset):
-    """Dataset class for Nutrition5k test data (for Kaggle submission)"""
+    """Dataset class for Nutrition5k test data with height processing"""
     
     def __init__(self):
         """Initialize test dataset"""
@@ -105,7 +135,7 @@ class Nutrition5kTestDataset(Dataset):
             transforms.Normalize(mean=Config.RGB_MEAN, std=Config.RGB_STD)
         ])
         
-        self.depth_transform = transforms.Compose([
+        self.height_transform = transforms.Compose([
             transforms.Resize((Config.IMAGE_SIZE, Config.IMAGE_SIZE)),
             transforms.ToTensor(),
         ])
@@ -116,17 +146,46 @@ class Nutrition5kTestDataset(Dataset):
     def __getitem__(self, idx):
         dish_id = self.dish_ids[idx]
         
+        # Check if cached height and mask exist
+        if not check_cache_exists(dish_id, Config.TEST_HEIGHT_CACHE, Config.TEST_MASK_CACHE):
+            # Generate on-the-fly if cache doesn't exist
+            preprocess_single_dish(
+                dish_id,
+                Config.TEST_DEPTH_DIR,
+                Config.TEST_HEIGHT_CACHE,
+                Config.TEST_MASK_CACHE
+            )
+        
+        # Load cached height map and mask
+        height_cm, food_mask = load_cached_height_and_mask(
+            dish_id,
+            Config.TEST_HEIGHT_CACHE,
+            Config.TEST_MASK_CACHE
+        )
+        
+        # Load RGB image
         rgb_path = Config.TEST_COLOR_DIR / dish_id / 'rgb.png'
-        depth_path = Config.TEST_DEPTH_DIR / dish_id / 'depth_raw.png'
-        
         rgb_img = Image.open(rgb_path).convert('RGB')
-        depth_img = Image.open(depth_path).convert('L')
+        rgb_np = np.array(rgb_img)
         
-        rgb_img = self.rgb_transform(rgb_img)
-        depth_img = self.depth_transform(depth_img)
-        depth_img = (depth_img - depth_img.min()) / (depth_img.max() - depth_img.min() + 1e-8)
+        # Apply mask to RGB (zero out non-food regions)
+        rgb_masked = rgb_np * food_mask[:, :, np.newaxis]
+        rgb_img_masked = Image.fromarray(rgb_masked.astype(np.uint8))
         
-        return rgb_img, depth_img, dish_id
+        # Apply mask to height (zero out non-food regions)
+        height_masked = height_cm * food_mask
+        height_img = Image.fromarray(height_masked.astype(np.float32))
+        
+        # Apply transforms
+        rgb_tensor = self.rgb_transform(rgb_img_masked)
+        height_tensor = self.height_transform(height_img)
+        
+        # Normalize height to [0, 1]
+        height_max = height_tensor.max()
+        if height_max > 0:
+            height_tensor = height_tensor / height_max
+        
+        return rgb_tensor, height_tensor, dish_id
 
 
 def validate_dataset():
@@ -279,9 +338,9 @@ if __name__ == '__main__':
     
     # Test loading a batch
     print("\n🧪 Testing batch loading...")
-    rgb, depth, calories = next(iter(train_loader))
+    rgb, height, calories = next(iter(train_loader))
     print(f"✓ RGB shape:     {rgb.shape}")
-    print(f"✓ Depth shape:   {depth.shape}")
+    print(f"✓ Height shape:  {height.shape}")
     print(f"✓ Calories shape: {calories.shape}")
     print(f"✓ Calorie range: [{calories.min():.1f}, {calories.max():.1f}]")
     

@@ -33,6 +33,14 @@ class Config:
     TRAIN_SPLIT_CSV = CACHE_DIR / 'train_split.csv'
     VAL_SPLIT_CSV = CACHE_DIR / 'val_split.csv'
     
+    # Height processing cache
+    HEIGHT_CACHE_DIR = CACHE_DIR / 'height_maps'
+    TRAIN_HEIGHT_CACHE = HEIGHT_CACHE_DIR / 'train'
+    TEST_HEIGHT_CACHE = HEIGHT_CACHE_DIR / 'test'
+    MASK_CACHE_DIR = CACHE_DIR / 'food_masks'
+    TRAIN_MASK_CACHE = MASK_CACHE_DIR / 'train'
+    TEST_MASK_CACHE = MASK_CACHE_DIR / 'test'
+    
     # ============= Model Hyperparameters =============
     BATCH_SIZE = 32
     EPOCHS = 50
@@ -63,6 +71,11 @@ class Config:
     COLOR_JITTER_BRIGHTNESS = 0.2
     COLOR_JITTER_CONTRAST = 0.2
     
+    # ============= Height Processing Parameters =============
+    HEIGHT_PERCENTILE = 70  # Percentile for plate depth reference
+    FOOD_HEIGHT_THRESHOLD = 0.5  # Minimum height (cm) to consider as food
+    DEPTH_TO_CM_SCALE = 100  # Depth values are divided by this to get cm
+    
     # ============= DataLoader Parameters =============
     NUM_WORKERS = 0
     PIN_MEMORY = False
@@ -72,6 +85,10 @@ class Config:
         """Create necessary directories if they don't exist"""
         cls.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
         cls.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cls.TRAIN_HEIGHT_CACHE.mkdir(parents=True, exist_ok=True)
+        cls.TEST_HEIGHT_CACHE.mkdir(parents=True, exist_ok=True)
+        cls.TRAIN_MASK_CACHE.mkdir(parents=True, exist_ok=True)
+        cls.TEST_MASK_CACHE.mkdir(parents=True, exist_ok=True)
     
     @classmethod
     def validate_paths(cls):
