@@ -1,5 +1,6 @@
 """
 Model definition and training for Nutrition5k calorie estimation
+InceptionV3 with 5-channel input (RGB + Depth + Height)
 """
 import torch
 import torch.nn as nn
@@ -12,145 +13,181 @@ from config import Config
 from data import get_dataloaders
 
 
-class CalorieEstimatorCNN(nn.Module):
-    """Dual-stream CNN: processes RGB and Height separately, then fuses"""
+class InceptionBlock(nn.Module):
+    """Basic Inception module"""
     
-    def __init__(self):
-        super(CalorieEstimatorCNN, self).__init__()
-        
-        # RGB stream - 3 convolutional layers
-        self.rgb_stream = nn.Sequential(
-            # Conv1: 3 -> 32
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(2),  # 224 -> 112
-            
-            # Conv2: 32 -> 64
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),  # 112 -> 56
-            
-            # Conv3: 64 -> 128
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1))  # Global average pooling
-        )
-        
-        # Height stream - 3 convolutional layers
-        self.height_stream = nn.Sequential(
-            # Conv1: 1 -> 32
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            
-            # Conv2: 32 -> 64
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            
-            # Conv3: 64 -> 128
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1))
-        )
-        
-        # Fusion layer + regression head
-        self.fusion = nn.Sequential(
-            nn.Linear(256, 128),  # 128 (RGB) + 128 (Height) = 256
-            nn.ReLU(),
-            nn.Dropout(Config.DROPOUT_RATE),
-            nn.Linear(128, 1)
-        )
-    
-    def forward(self, rgb, height):
-        """
-        Args:
-            rgb: RGB images [batch, 3, 224, 224]
-            height: Height maps [batch, 1, 224, 224]
-        
-        Returns:
-            calories: Predicted calories [batch]
-        """
-        # Extract features
-        rgb_feat = self.rgb_stream(rgb).flatten(1)         # [batch, 128]
-        height_feat = self.height_stream(height).flatten(1) # [batch, 128]
-        
-        # Fuse features
-        fused = torch.cat([rgb_feat, height_feat], dim=1)  # [batch, 256]
-        
-        # Regress to calories
-        calories = self.fusion(fused).squeeze(1)           # [batch]
-        
-        return calories
-
-class AttentionFusionCNN(nn.Module):
-    """Dual-stream CNN with attention-based fusion for RGB and Height"""
-    
-    def __init__(self):
+    def __init__(self, in_channels, ch1x1, ch3x3red, ch3x3, ch5x5red, ch5x5, pool_proj):
         super().__init__()
         
-        # RGB stream
-        self.rgb_stream = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128), nn.ReLU(), nn.AdaptiveAvgPool2d((1, 1))
+        # 1x1 conv branch
+        self.branch1 = nn.Sequential(
+            nn.Conv2d(in_channels, ch1x1, kernel_size=1),
+            nn.BatchNorm2d(ch1x1),
+            nn.ReLU(inplace=True)
         )
         
-        # Height stream
-        self.height_stream = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128), nn.ReLU(), nn.AdaptiveAvgPool2d((1, 1))
+        # 1x1 conv -> 3x3 conv branch
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(in_channels, ch3x3red, kernel_size=1),
+            nn.BatchNorm2d(ch3x3red),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(ch3x3red, ch3x3, kernel_size=3, padding=1),
+            nn.BatchNorm2d(ch3x3),
+            nn.ReLU(inplace=True)
         )
         
-        # Attention mechanism
-        self.attention = nn.Sequential(
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Linear(64, 2),
-            nn.Softmax(dim=1)
+        # 1x1 conv -> 5x5 conv branch (using two 3x3 convs)
+        self.branch3 = nn.Sequential(
+            nn.Conv2d(in_channels, ch5x5red, kernel_size=1),
+            nn.BatchNorm2d(ch5x5red),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(ch5x5red, ch5x5, kernel_size=3, padding=1),
+            nn.BatchNorm2d(ch5x5),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(ch5x5, ch5x5, kernel_size=3, padding=1),
+            nn.BatchNorm2d(ch5x5),
+            nn.ReLU(inplace=True)
         )
         
-        # Regression head
-        self.regressor = nn.Sequential(
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Dropout(Config.DROPOUT_RATE),
-            nn.Linear(128, 1)
+        # 3x3 pool -> 1x1 conv branch
+        self.branch4 = nn.Sequential(
+            nn.MaxPool2d(kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(in_channels, pool_proj, kernel_size=1),
+            nn.BatchNorm2d(pool_proj),
+            nn.ReLU(inplace=True)
         )
     
-    def forward(self, rgb, height):
+    def forward(self, x):
+        branch1 = self.branch1(x)
+        branch2 = self.branch2(x)
+        branch3 = self.branch3(x)
+        branch4 = self.branch4(x)
+        
+        outputs = [branch1, branch2, branch3, branch4]
+        return torch.cat(outputs, 1)
+
+
+class InceptionV3Regression(nn.Module):
+    """
+    InceptionV3-inspired architecture for calorie regression
+    Modified to accept 5-channel input (RGB + Depth + Height)
+    No auxiliary classifiers (not needed for regression)
+    """
+    
+    def __init__(self, num_channels=5, dropout_rate=0.3):
+        super().__init__()
+        
+        # ============= Initial Convolution Layers =============
+        # Modified first layer to accept 5 channels instead of 3
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(num_channels, 32, kernel_size=3, stride=2, padding=0),  # 5 -> 32 channels
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=0),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.maxpool1 = nn.MaxPool2d(kernel_size=3, stride=2, padding=0)
+        
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(64, 80, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(80),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.conv5 = nn.Sequential(
+            nn.Conv2d(80, 192, kernel_size=3, stride=1, padding=0),
+            nn.BatchNorm2d(192),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.maxpool2 = nn.MaxPool2d(kernel_size=3, stride=2, padding=0)
+        
+        # ============= Inception Blocks =============
+        # Inception 3a, 3b
+        self.inception3a = InceptionBlock(192, 64, 96, 128, 16, 32, 32)
+        self.inception3b = InceptionBlock(256, 128, 128, 192, 32, 96, 64)
+        
+        self.maxpool3 = nn.MaxPool2d(kernel_size=3, stride=2, padding=0)
+        
+        # Inception 4a, 4b, 4c, 4d, 4e
+        self.inception4a = InceptionBlock(480, 192, 96, 208, 16, 48, 64)
+        self.inception4b = InceptionBlock(512, 160, 112, 224, 24, 64, 64)
+        self.inception4c = InceptionBlock(512, 128, 128, 256, 24, 64, 64)
+        self.inception4d = InceptionBlock(512, 112, 144, 288, 32, 64, 64)
+        self.inception4e = InceptionBlock(528, 256, 160, 320, 32, 128, 128)
+        
+        self.maxpool4 = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
+        
+        # Inception 5a, 5b
+        self.inception5a = InceptionBlock(832, 256, 160, 320, 32, 128, 128)
+        self.inception5b = InceptionBlock(832, 384, 192, 384, 48, 128, 128)
+        
+        # ============= Regression Head =============
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.dropout = nn.Dropout(p=dropout_rate)
+        
+        # Final regression layers
+        self.fc1 = nn.Linear(1024, 512)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout2 = nn.Dropout(p=dropout_rate)
+        self.fc2 = nn.Linear(512, 1)
+    
+    def forward(self, x):
         """
         Args:
-            rgb: RGB images [batch, 3, 224, 224]
-            height: Height maps [batch, 1, 224, 224]
+            x: Input tensor [batch, 5, 299, 299] (RGB + Depth + Height)
         
         Returns:
             calories: Predicted calories [batch]
         """
-        rgb_feat = self.rgb_stream(rgb).flatten(1)
-        height_feat = self.height_stream(height).flatten(1)
+        # Initial convolutions
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        x = self.maxpool1(x)
         
-        # Learn attention weights
-        concat = torch.cat([rgb_feat, height_feat], dim=1)
-        weights = self.attention(concat)  # [batch, 2]
+        x = self.conv4(x)
+        x = self.conv5(x)
+        x = self.maxpool2(x)
         
-        # Weighted fusion
-        fused = weights[:, 0:1] * rgb_feat + weights[:, 1:2] * height_feat
+        # Inception modules
+        x = self.inception3a(x)
+        x = self.inception3b(x)
+        x = self.maxpool3(x)
         
-        return self.regressor(fused).squeeze(1)
+        x = self.inception4a(x)
+        x = self.inception4b(x)
+        x = self.inception4c(x)
+        x = self.inception4d(x)
+        x = self.inception4e(x)
+        x = self.maxpool4(x)
+        
+        x = self.inception5a(x)
+        x = self.inception5b(x)
+        
+        # Global average pooling
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.dropout(x)
+        
+        # Regression head
+        x = self.fc1(x)
+        x = self.relu(x)
+        x = self.dropout2(x)
+        x = self.fc2(x)
+        
+        return x.squeeze(1)  # [batch]
 
 
 class Trainer:
@@ -196,13 +233,12 @@ class Trainer:
         self.model.train()
         total_loss = 0
         
-        for rgb, height, calories in tqdm(self.train_loader, desc='Training'):
-            rgb = rgb.to(self.device)
-            height = height.to(self.device)
+        for inputs, calories in tqdm(self.train_loader, desc='Training'):
+            inputs = inputs.to(self.device)
             calories = calories.to(self.device)
             
             # Forward pass
-            pred_calories = self.model(rgb, height)
+            pred_calories = self.model(inputs)
             loss = self.criterion(pred_calories, calories)
             
             # Backward pass
@@ -221,12 +257,11 @@ class Trainer:
         total_loss = 0
         
         with torch.no_grad():
-            for rgb, height, calories in tqdm(self.val_loader, desc='Validation'):
-                rgb = rgb.to(self.device)
-                height = height.to(self.device)
+            for inputs, calories in tqdm(self.val_loader, desc='Validation'):
+                inputs = inputs.to(self.device)
                 calories = calories.to(self.device)
                 
-                pred_calories = self.model(rgb, height)
+                pred_calories = self.model(inputs)
                 loss = self.criterion(pred_calories, calories)
                 
                 total_loss += loss.item()
@@ -366,8 +401,8 @@ class Trainer:
         # 4. Summary statistics
         axes[1, 1].axis('off')
         summary_text = f"""
-    Training Summary
-    ================
+    Training Summary (InceptionV3 + 5 Channels)
+    ============================================
     
     Total Epochs: {len(epochs)}
     
@@ -386,7 +421,7 @@ class Trainer:
     • Best RMSE: {best_rmse:.4f}
     • Reduction: {self.history['val_rmse'][0] - best_rmse:.4f}
         """
-        axes[1, 1].text(0.1, 0.5, summary_text, fontsize=12, family='monospace',
+        axes[1, 1].text(0.1, 0.5, summary_text, fontsize=11, family='monospace',
                         verticalalignment='center')
         
         plt.tight_layout()
@@ -418,7 +453,6 @@ def main():
     # Setup
     Config.validate_paths()
     Config.create_directories()
-    Config.print_config()
     
     # Get device
     device = get_device()
@@ -426,12 +460,19 @@ def main():
     # Load data
     print("\n📦 Loading data...")
     train_loader, val_loader = get_dataloaders()
-    print(f"✓ Training samples:   {len(train_loader.dataset)}")
+    
+    # Print config (now with normalization stats)
+    Config.print_config()
+    
+    print(f"\n✓ Training samples:   {len(train_loader.dataset)}")
     print(f"✓ Validation samples: {len(val_loader.dataset)}")
     
     # Create model
-    print("\n🏗️  Creating model...")
-    model = AttentionFusionCNN().to(device)
+    print("\n🏗️  Creating InceptionV3 model...")
+    model = InceptionV3Regression(
+        num_channels=5,
+        dropout_rate=Config.DROPOUT_RATE
+    ).to(device)
     
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())

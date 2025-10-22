@@ -28,18 +28,15 @@ class Config:
     CHECKPOINT_DIR = Path(os.getenv('CHECKPOINT_DIR', PROJECT_ROOT / 'checkpoints'))
     CACHE_DIR = PROJECT_ROOT / 'cache'
     
-    # Cache files
-    VALID_DATA_CACHE = CACHE_DIR / 'valid_data_cache.pkl'
-    TRAIN_SPLIT_CSV = CACHE_DIR / 'train_split.csv'
-    VAL_SPLIT_CSV = CACHE_DIR / 'val_split.csv'
+    # Cache files (NEW NAMES - fresh start!)
+    VALID_DATA_CACHE = CACHE_DIR / 'valid_data_cache_v2.pkl'
+    TRAIN_SPLIT_CSV = CACHE_DIR / 'train_split_v2.csv'
+    VAL_SPLIT_CSV = CACHE_DIR / 'val_split_v2.csv'
+    NORMALIZATION_STATS = CACHE_DIR / 'normalization_stats.pkl'
     
-    # Height processing cache
-    HEIGHT_CACHE_DIR = CACHE_DIR / 'height_maps'
-    TRAIN_HEIGHT_CACHE = HEIGHT_CACHE_DIR / 'train'
-    TEST_HEIGHT_CACHE = HEIGHT_CACHE_DIR / 'test'
-    MASK_CACHE_DIR = CACHE_DIR / 'food_masks'
-    TRAIN_MASK_CACHE = MASK_CACHE_DIR / 'train'
-    TEST_MASK_CACHE = MASK_CACHE_DIR / 'test'
+    # ============= Feature Engineering Parameters =============
+    DEPTH_TO_CM_SCALE = 100  # Conversion factor for depth to cm
+    HEIGHT_PERCENTILE = 70   # Percentile for plate depth estimation
     
     # ============= Model Hyperparameters =============
     BATCH_SIZE = 32
@@ -51,30 +48,33 @@ class Config:
     
     # Learning rate scheduler
     LR_SCHEDULER_FACTOR = 0.5
-    LR_SCHEDULER_PATIENCE = 10
+    LR_SCHEDULER_PATIENCE = 5
     LR_SCHEDULER_MIN_LR = 1e-6
     
-    # Early stopping
-    EARLY_STOP_PATIENCE = 20
+    # Early stopping (10 epochs without improvement)
+    EARLY_STOP_PATIENCE = 10
     
     # Model parameters
     DROPOUT_RATE = 0.3
     
     # ============= Image Parameters =============
-    IMAGE_SIZE = 224
+    IMAGE_SIZE = 299  # InceptionV3 uses 299x299
+    
+    # RGB normalization (ImageNet stats)
     RGB_MEAN = [0.485, 0.456, 0.406]
     RGB_STD = [0.229, 0.224, 0.225]
+    
+    # Depth and Height normalization (to be calculated from training data)
+    DEPTH_MEAN = None  # Will be set after calculation
+    DEPTH_STD = None
+    HEIGHT_MEAN = None
+    HEIGHT_STD = None
     
     # Data augmentation
     ROTATION_DEGREES = 15
     CROP_SCALE = (0.9, 1.0)
     COLOR_JITTER_BRIGHTNESS = 0.2
     COLOR_JITTER_CONTRAST = 0.2
-    
-    # ============= Height Processing Parameters =============
-    HEIGHT_PERCENTILE = 70  # Percentile for plate depth reference
-    FOOD_HEIGHT_THRESHOLD = 0.5  # Minimum height (cm) to consider as food
-    DEPTH_TO_CM_SCALE = 100  # Depth values are divided by this to get cm
     
     # ============= DataLoader Parameters =============
     NUM_WORKERS = 0
@@ -85,10 +85,6 @@ class Config:
         """Create necessary directories if they don't exist"""
         cls.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
         cls.CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        cls.TRAIN_HEIGHT_CACHE.mkdir(parents=True, exist_ok=True)
-        cls.TEST_HEIGHT_CACHE.mkdir(parents=True, exist_ok=True)
-        cls.TRAIN_MASK_CACHE.mkdir(parents=True, exist_ok=True)
-        cls.TEST_MASK_CACHE.mkdir(parents=True, exist_ok=True)
     
     @classmethod
     def validate_paths(cls):
@@ -112,10 +108,18 @@ class Config:
             )
     
     @classmethod
+    def set_normalization_stats(cls, depth_mean, depth_std, height_mean, height_std):
+        """Set depth and height normalization statistics"""
+        cls.DEPTH_MEAN = depth_mean
+        cls.DEPTH_STD = depth_std
+        cls.HEIGHT_MEAN = height_mean
+        cls.HEIGHT_STD = height_std
+    
+    @classmethod
     def print_config(cls):
         """Print current configuration"""
         print("=" * 60)
-        print("Configuration")
+        print("🚀 Configuration (v2 - InceptionV3 + 5 Channels)")
         print("=" * 60)
         print(f"📁 Data Root:        {cls.DATA_ROOT}")
         print(f"📄 Training CSV:     {cls.TRAIN_CSV}")
@@ -126,4 +130,17 @@ class Config:
         print(f"   Epochs:           {cls.EPOCHS}")
         print(f"   Learning Rate:    {cls.LEARNING_RATE}")
         print(f"   Val Split:        {cls.VAL_SPLIT}")
+        print(f"   Early Stop:       {cls.EARLY_STOP_PATIENCE} epochs")
+        print(f"\n🎨 Feature Engineering:")
+        print(f"   Image Size:       {cls.IMAGE_SIZE}x{cls.IMAGE_SIZE}")
+        print(f"   Depth Scale:      1/{cls.DEPTH_TO_CM_SCALE}")
+        print(f"   Height Percentile: {cls.HEIGHT_PERCENTILE}")
+        if cls.DEPTH_MEAN is not None:
+            print(f"\n📊 Normalization Stats:")
+            print(f"   RGB Mean:         {[f'{x:.3f}' for x in cls.RGB_MEAN]}")
+            print(f"   RGB Std:          {[f'{x:.3f}' for x in cls.RGB_STD]}")
+            print(f"   Depth Mean:       {cls.DEPTH_MEAN:.3f}")
+            print(f"   Depth Std:        {cls.DEPTH_STD:.3f}")
+            print(f"   Height Mean:      {cls.HEIGHT_MEAN:.3f}")
+            print(f"   Height Std:       {cls.HEIGHT_STD:.3f}")
         print("=" * 60)
