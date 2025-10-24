@@ -1,6 +1,6 @@
 """
 Model definition and training for Nutrition5k calorie estimation
-InceptionV3 with 5-channel input (RGB + Depth + Height)
+Modified: InceptionV3 with 4-channel input (RGB + Depth only, NO height)
 """
 import torch
 import torch.nn as nn
@@ -70,17 +70,17 @@ class InceptionBlock(nn.Module):
 class InceptionV3Regression(nn.Module):
     """
     InceptionV3-inspired architecture for calorie regression
-    Modified to accept 5-channel input (RGB + Depth + Height)
+    Modified to accept 4-channel input (RGB + Depth only, NO height)
     No auxiliary classifiers (not needed for regression)
     """
     
-    def __init__(self, num_channels=5, dropout_rate=0.3):
+    def __init__(self, num_channels=4, dropout_rate=0.3):
         super().__init__()
         
         # ============= Initial Convolution Layers =============
-        # Modified first layer to accept 5 channels instead of 3
+        # Modified first layer to accept 4 channels instead of 3
         self.conv1 = nn.Sequential(
-            nn.Conv2d(num_channels, 32, kernel_size=3, stride=2, padding=0),  # 5 -> 32 channels
+            nn.Conv2d(num_channels, 32, kernel_size=3, stride=2, padding=0),  # 4 -> 32 channels
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True)
         )
@@ -146,7 +146,7 @@ class InceptionV3Regression(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: Input tensor [batch, 5, 299, 299] (RGB + Depth + Height)
+            x: Input tensor [batch, 4, 299, 299] (RGB + Depth only)
         
         Returns:
             calories: Predicted calories [batch]
@@ -233,7 +233,8 @@ class Trainer:
         self.model.train()
         total_loss = 0
         
-        for inputs, calories in tqdm(self.train_loader, desc='Training'):
+        pbar = tqdm(self.train_loader, desc='Training')
+        for inputs, calories in pbar:
             inputs = inputs.to(self.device)
             calories = calories.to(self.device)
             
@@ -247,6 +248,7 @@ class Trainer:
             self.optimizer.step()
             
             total_loss += loss.item()
+            pbar.set_postfix({'loss': loss.item()})
         
         avg_loss = total_loss / len(self.train_loader)
         return avg_loss
@@ -257,7 +259,7 @@ class Trainer:
         total_loss = 0
         
         with torch.no_grad():
-            for inputs, calories in tqdm(self.val_loader, desc='Validation'):
+            for inputs, calories in tqdm(self.val_loader, desc='Validating'):
                 inputs = inputs.to(self.device)
                 calories = calories.to(self.device)
                 
@@ -346,7 +348,8 @@ class Trainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'val_loss': val_loss,
             'val_rmse': val_rmse,
-            'history': self.history
+            'history': self.history,
+            'patience_counter': self.patience_counter
         }
         
         filename = 'best_model.pth' if is_best else f'checkpoint_epoch_{epoch}.pth'
@@ -401,8 +404,8 @@ class Trainer:
         # 4. Summary statistics
         axes[1, 1].axis('off')
         summary_text = f"""
-    Training Summary (InceptionV3 + 5 Channels)
-    ============================================
+    Training Summary (InceptionV3 + 4 Channels - NO HEIGHT)
+    =========================================================
     
     Total Epochs: {len(epochs)}
     
@@ -468,9 +471,9 @@ def main():
     print(f"✓ Validation samples: {len(val_loader.dataset)}")
     
     # Create model
-    print("\n🏗️  Creating InceptionV3 model...")
+    print("\n🏗️  Creating InceptionV3 model (4 channels - NO HEIGHT)...")
     model = InceptionV3Regression(
-        num_channels=5,
+        num_channels=4,
         dropout_rate=Config.DROPOUT_RATE
     ).to(device)
     

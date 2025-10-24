@@ -1,6 +1,7 @@
 """
 Resume training from a saved checkpoint
 Useful for continuing training with a lower learning rate or more epochs
+Modified: 4-channel input (RGB + Depth only, NO height)
 """
 import torch
 import torch.nn as nn
@@ -49,9 +50,9 @@ def resume_training(
     print(f"✓ Validation samples: {len(val_loader.dataset)}")
     
     # Create model
-    print("\n🏗️  Creating InceptionV3 model...")
+    print("\n🏗️  Creating InceptionV3 model (4 channels - NO HEIGHT)...")
     model = InceptionV3Regression(
-        num_channels=5,
+        num_channels=4,
         dropout_rate=Config.DROPOUT_RATE
     ).to(device)
     
@@ -62,7 +63,7 @@ def resume_training(
     
     print(f"\n📂 Loading checkpoint from {checkpoint_path}...")
     # load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=device,weights_only=False)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
     # Load model state
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -125,12 +126,12 @@ def main():
     # Configuration for resume training
     CHECKPOINT_PATH = 'checkpoints/best_model.pth'
     NUM_ADDITIONAL_EPOCHS = 20
-    NEW_LEARNING_RATE = None  # Keep current LR (0.00025 in your case)
+    NEW_LEARNING_RATE = None  # Keep current LR
     RESET_SCHEDULER = False   # Keep scheduler state
     RESET_EARLY_STOPPING = True  # Reset early stopping (give it 10 more chances)
     
     print("=" * 60)
-    print("🔄 RESUME TRAINING")
+    print("🔄 RESUME TRAINING (4 Channels - NO HEIGHT)")
     print("=" * 60)
     print(f"Checkpoint:       {CHECKPOINT_PATH}")
     print(f"Additional Epochs: {NUM_ADDITIONAL_EPOCHS}")

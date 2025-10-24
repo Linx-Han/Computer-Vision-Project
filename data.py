@@ -1,6 +1,6 @@
 """
 Data loading and preprocessing for Nutrition5k dataset
-5-channel input: RGB + Depth + Height
+Modified: 4-channel input (RGB + Depth only, NO height)
 """
 import pickle
 import numpy as np
@@ -15,30 +15,8 @@ from tqdm import tqdm
 from config import Config
 
 
-def calculate_height_from_depth(depth_np):
-    """
-    Calculate height above plate from depth image
-    
-    Args:
-        depth_np: Depth image as numpy array
-    
-    Returns:
-        height_cm: Height above plate in cm
-    """
-    # Convert to cm
-    depth_cm = depth_np.astype(np.float32) / Config.DEPTH_TO_CM_SCALE
-    
-    # Find plate depth (reference plane) using percentile
-    plate_depth = float(np.percentile(depth_cm, Config.HEIGHT_PERCENTILE))
-    
-    # Calculate height above plate (clip negative values)
-    height_cm = np.clip(plate_depth - depth_cm, a_min=0, a_max=None)
-    
-    return height_cm
-
-
 class Nutrition5kDataset(Dataset):
-    """Dataset class for Nutrition5k with 5-channel input"""
+    """Dataset class for Nutrition5k with 4-channel input (RGB + Depth)"""
     
     def __init__(self, csv_file, is_train=True):
         """
@@ -58,8 +36,6 @@ class Nutrition5kDataset(Dataset):
         self.rgb_std = np.array(Config.RGB_STD, dtype=np.float32).reshape(3, 1, 1)
         self.depth_mean = Config.DEPTH_MEAN
         self.depth_std = Config.DEPTH_STD
-        self.height_mean = Config.HEIGHT_MEAN
-        self.height_std = Config.HEIGHT_STD
         
         # Basic transforms (resize only, we'll do augmentation manually)
         self.resize = transforms.Resize((Config.IMAGE_SIZE, Config.IMAGE_SIZE))
@@ -91,21 +67,17 @@ class Nutrition5kDataset(Dataset):
             rgb_np = np.array(rgb_img).astype(np.float32) / 255.0  # [H, W, 3] in [0, 1]
             depth_np = np.array(depth_img).astype(np.float32)       # [H, W] raw values
             
-            # Calculate height from depth
-            height_np = calculate_height_from_depth(depth_np)  # [H, W] in cm
-            
             # Convert depth to cm
             depth_cm = depth_np / Config.DEPTH_TO_CM_SCALE  # [H, W] in cm
             
             # Convert to tensors and rearrange to [C, H, W]
             rgb_tensor = torch.from_numpy(rgb_np).permute(2, 0, 1)  # [3, H, W]
             depth_tensor = torch.from_numpy(depth_cm).unsqueeze(0)  # [1, H, W]
-            height_tensor = torch.from_numpy(height_np).unsqueeze(0)  # [1, H, W]
             
             # Apply data augmentation if training
             if self.is_train:
                 # Stack all channels for synchronized augmentation
-                all_channels = torch.cat([rgb_tensor, depth_tensor, height_tensor], dim=0)  # [5, H, W]
+                all_channels = torch.cat([rgb_tensor, depth_tensor], dim=0)  # [4, H, W]
                 
                 # Random rotation
                 if np.random.rand() < 0.5:
@@ -124,7 +96,6 @@ class Nutrition5kDataset(Dataset):
                 # Split back
                 rgb_tensor = all_channels[0:3]
                 depth_tensor = all_channels[3:4]
-                height_tensor = all_channels[4:5]
                 
                 # Color jitter (RGB only)
                 if np.random.rand() < 0.5:
@@ -138,16 +109,14 @@ class Nutrition5kDataset(Dataset):
             # Normalize all channels
             rgb_normalized = (rgb_tensor - torch.from_numpy(self.rgb_mean)) / torch.from_numpy(self.rgb_std)
             depth_normalized = (depth_tensor - self.depth_mean) / self.depth_std
-            height_normalized = (height_tensor - self.height_mean) / self.height_std
             
-            # Concatenate all 5 channels
-            five_channel_input = torch.cat([
+            # Concatenate all 4 channels (NO HEIGHT)
+            four_channel_input = torch.cat([
                 rgb_normalized,      # [3, H, W]
                 depth_normalized,    # [1, H, W]
-                height_normalized    # [1, H, W]
-            ], dim=0)  # [5, H, W]
+            ], dim=0)  # [4, H, W]
             
-            return five_channel_input, torch.tensor(calories, dtype=torch.float32)
+            return four_channel_input, torch.tensor(calories, dtype=torch.float32)
         
         except Exception as e:
             print(f"\n⚠️  Error loading {dish_id}: {str(e)}")
@@ -156,7 +125,7 @@ class Nutrition5kDataset(Dataset):
 
 
 class Nutrition5kTestDataset(Dataset):
-    """Test dataset with 5-channel input"""
+    """Test dataset with 4-channel input (RGB + Depth)"""
     
     def __init__(self):
         """Initialize test dataset"""
@@ -171,8 +140,6 @@ class Nutrition5kTestDataset(Dataset):
         self.rgb_std = np.array(Config.RGB_STD, dtype=np.float32).reshape(3, 1, 1)
         self.depth_mean = Config.DEPTH_MEAN
         self.depth_std = Config.DEPTH_STD
-        self.height_mean = Config.HEIGHT_MEAN
-        self.height_std = Config.HEIGHT_STD
         
         self.resize = transforms.Resize((Config.IMAGE_SIZE, Config.IMAGE_SIZE))
     
@@ -195,28 +162,25 @@ class Nutrition5kTestDataset(Dataset):
         rgb_np = np.array(rgb_img).astype(np.float32) / 255.0
         depth_np = np.array(depth_img).astype(np.float32)
         
-        height_np = calculate_height_from_depth(depth_np)
         depth_cm = depth_np / Config.DEPTH_TO_CM_SCALE
         
         rgb_tensor = torch.from_numpy(rgb_np).permute(2, 0, 1)
         depth_tensor = torch.from_numpy(depth_cm).unsqueeze(0)
-        height_tensor = torch.from_numpy(height_np).unsqueeze(0)
         
         # Normalize
         rgb_normalized = (rgb_tensor - torch.from_numpy(self.rgb_mean)) / torch.from_numpy(self.rgb_std)
         depth_normalized = (depth_tensor - self.depth_mean) / self.depth_std
-        height_normalized = (height_tensor - self.height_mean) / self.height_std
         
-        five_channel_input = torch.cat([rgb_normalized, depth_normalized, height_normalized], dim=0)
+        four_channel_input = torch.cat([rgb_normalized, depth_normalized], dim=0)
         
-        return five_channel_input, dish_id
+        return four_channel_input, dish_id
 
 
 def compute_normalization_stats():
     """
-    Compute mean and std for depth and height channels from training data
+    Compute mean and std for depth channel from training data
     """
-    print("\n📊 Computing normalization statistics for depth and height...")
+    print("\n📊 Computing normalization statistics for depth...")
     
     # Check if already computed and cached
     if Config.NORMALIZATION_STATS.exists():
@@ -224,18 +188,15 @@ def compute_normalization_stats():
         with open(Config.NORMALIZATION_STATS, 'rb') as f:
             stats = pickle.load(f)
         Config.set_normalization_stats(
-            stats['depth_mean'], stats['depth_std'],
-            stats['height_mean'], stats['height_std']
+            stats['depth_mean'], stats['depth_std']
         )
         print(f"  Depth:  mean={stats['depth_mean']:.3f}, std={stats['depth_std']:.3f}")
-        print(f"  Height: mean={stats['height_mean']:.3f}, std={stats['height_std']:.3f}")
         return
     
     # Load valid dataframe
     valid_df = validate_dataset()
     
     depth_values = []
-    height_values = []
     
     print("  Processing images...")
     for idx in tqdm(range(min(len(valid_df), 1000)), desc="Computing stats"):  # Sample 1000 images
@@ -250,41 +211,31 @@ def compute_normalization_stats():
             # Convert to cm
             depth_cm = depth_np / Config.DEPTH_TO_CM_SCALE
             
-            # Calculate height
-            height_cm = calculate_height_from_depth(depth_np)
-            
             # Collect values
             depth_values.append(depth_cm.flatten())
-            height_values.append(height_cm.flatten())
         except:
             continue
     
     # Calculate statistics
     depth_all = np.concatenate(depth_values)
-    height_all = np.concatenate(height_values)
     
     depth_mean = float(np.mean(depth_all))
     depth_std = float(np.std(depth_all))
-    height_mean = float(np.mean(height_all))
-    height_std = float(np.std(height_all))
     
     # Save stats
     stats = {
         'depth_mean': depth_mean,
-        'depth_std': depth_std,
-        'height_mean': height_mean,
-        'height_std': height_std
+        'depth_std': depth_std
     }
     
     with open(Config.NORMALIZATION_STATS, 'wb') as f:
         pickle.dump(stats, f)
     
     # Set in config
-    Config.set_normalization_stats(depth_mean, depth_std, height_mean, height_std)
+    Config.set_normalization_stats(depth_mean, depth_std)
     
     print(f"✓ Statistics computed and cached")
     print(f"  Depth:  mean={depth_mean:.3f}, std={depth_std:.3f}")
-    print(f"  Height: mean={height_mean:.3f}, std={height_std:.3f}")
 
 
 def validate_dataset():
@@ -436,8 +387,8 @@ if __name__ == '__main__':
     
     # Test loading a batch
     print("\n🧪 Testing batch loading...")
-    five_channel, calories = next(iter(train_loader))
-    print(f"✓ Input shape:    {five_channel.shape}  (should be [batch, 5, 299, 299])")
+    four_channel, calories = next(iter(train_loader))
+    print(f"✓ Input shape:    {four_channel.shape}  (should be [batch, 4, 299, 299])")
     print(f"✓ Calories shape: {calories.shape}")
     print(f"✓ Calorie range:  [{calories.min():.1f}, {calories.max():.1f}]")
     

@@ -1,6 +1,7 @@
 """
 Configuration file for Nutrition5k project
 Centralized path and hyperparameter management
+Modified: 4-channel input (RGB + Depth only, NO height)
 """
 import os
 from pathlib import Path
@@ -28,15 +29,14 @@ class Config:
     CHECKPOINT_DIR = Path(os.getenv('CHECKPOINT_DIR', PROJECT_ROOT / 'checkpoints'))
     CACHE_DIR = PROJECT_ROOT / 'cache'
     
-    # Cache files (NEW NAMES - fresh start!)
-    VALID_DATA_CACHE = CACHE_DIR / 'valid_data_cache_v2.pkl'
-    TRAIN_SPLIT_CSV = CACHE_DIR / 'train_split_v2.csv'
-    VAL_SPLIT_CSV = CACHE_DIR / 'val_split_v2.csv'
-    NORMALIZATION_STATS = CACHE_DIR / 'normalization_stats.pkl'
+    # Cache files (NO HEIGHT VERSION)
+    VALID_DATA_CACHE = CACHE_DIR / 'valid_data_cache_v3_no_height.pkl'
+    TRAIN_SPLIT_CSV = CACHE_DIR / 'train_split_v3_no_height.csv'
+    VAL_SPLIT_CSV = CACHE_DIR / 'val_split_v3_no_height.csv'
+    NORMALIZATION_STATS = CACHE_DIR / 'normalization_stats_no_height.pkl'
     
     # ============= Feature Engineering Parameters =============
     DEPTH_TO_CM_SCALE = 100  # Conversion factor for depth to cm
-    HEIGHT_PERCENTILE = 70   # Percentile for plate depth estimation
     
     # ============= Model Hyperparameters =============
     BATCH_SIZE = 32
@@ -52,7 +52,7 @@ class Config:
     LR_SCHEDULER_MIN_LR = 1e-6
     
     # Early stopping (10 epochs without improvement)
-    EARLY_STOP_PATIENCE = 10
+    EARLY_STOP_PATIENCE = 15
     
     # Model parameters
     DROPOUT_RATE = 0.3
@@ -64,11 +64,9 @@ class Config:
     RGB_MEAN = [0.485, 0.456, 0.406]
     RGB_STD = [0.229, 0.224, 0.225]
     
-    # Depth and Height normalization (to be calculated from training data)
+    # Depth normalization (to be calculated from training data)
     DEPTH_MEAN = None  # Will be set after calculation
     DEPTH_STD = None
-    HEIGHT_MEAN = None
-    HEIGHT_STD = None
     
     # Data augmentation
     ROTATION_DEGREES = 15
@@ -108,18 +106,16 @@ class Config:
             )
     
     @classmethod
-    def set_normalization_stats(cls, depth_mean, depth_std, height_mean, height_std):
-        """Set depth and height normalization statistics"""
+    def set_normalization_stats(cls, depth_mean, depth_std):
+        """Set depth normalization statistics"""
         cls.DEPTH_MEAN = depth_mean
         cls.DEPTH_STD = depth_std
-        cls.HEIGHT_MEAN = height_mean
-        cls.HEIGHT_STD = height_std
     
     @classmethod
     def print_config(cls):
         """Print current configuration"""
         print("=" * 60)
-        print("🚀 Configuration (v2 - InceptionV3 + 5 Channels)")
+        print("🚀 Configuration (v3 - InceptionV3 + 4 Channels - NO HEIGHT)")
         print("=" * 60)
         print(f"📁 Data Root:        {cls.DATA_ROOT}")
         print(f"📄 Training CSV:     {cls.TRAIN_CSV}")
@@ -134,13 +130,11 @@ class Config:
         print(f"\n🎨 Feature Engineering:")
         print(f"   Image Size:       {cls.IMAGE_SIZE}x{cls.IMAGE_SIZE}")
         print(f"   Depth Scale:      1/{cls.DEPTH_TO_CM_SCALE}")
-        print(f"   Height Percentile: {cls.HEIGHT_PERCENTILE}")
+        print(f"   Channels:         4 (RGB + Depth ONLY)")
         if cls.DEPTH_MEAN is not None:
             print(f"\n📊 Normalization Stats:")
             print(f"   RGB Mean:         {[f'{x:.3f}' for x in cls.RGB_MEAN]}")
             print(f"   RGB Std:          {[f'{x:.3f}' for x in cls.RGB_STD]}")
             print(f"   Depth Mean:       {cls.DEPTH_MEAN:.3f}")
             print(f"   Depth Std:        {cls.DEPTH_STD:.3f}")
-            print(f"   Height Mean:      {cls.HEIGHT_MEAN:.3f}")
-            print(f"   Height Std:       {cls.HEIGHT_STD:.3f}")
         print("=" * 60)

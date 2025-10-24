@@ -1,6 +1,7 @@
 """
 Prediction script for Nutrition5k test set
-Generates Kaggle submission file using InceptionV3 + 5-channel model
+Generates Kaggle submission file using InceptionV3 + 4-channel model (NO HEIGHT)
+Modified: RGB + Depth only
 """
 import torch
 import pandas as pd
@@ -33,9 +34,9 @@ def predict_test_set(model_path='checkpoints/best_model.pth', output_file='submi
     device = get_device()
     
     # Load model
-    print("\n📂 Loading model...")
+    print("\n📂 Loading model (4 channels - NO HEIGHT)...")
     model = InceptionV3Regression(
-        num_channels=5,
+        num_channels=4,
         dropout_rate=Config.DROPOUT_RATE
     ).to(device)
     
@@ -43,7 +44,7 @@ def predict_test_set(model_path='checkpoints/best_model.pth', output_file='submi
     if not model_path.exists():
         raise FileNotFoundError(f"❌ Model not found: {model_path}")
     
-    checkpoint = torch.load(model_path, map_location=device,weights_only=False)
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     
@@ -232,14 +233,15 @@ def main():
     
     # Configuration
     MODEL_PATH = 'checkpoints/best_model.pth'
-    OUTPUT_FILE = 'submission.csv'
+    OUTPUT_FILE = 'submission_no_height.csv'  # Different filename to avoid confusion
     PREVIOUS_SUBMISSION = None  # Set to previous submission file for comparison
     
     print("="*70)
-    print("🔮 NUTRITION5K TEST SET PREDICTION")
+    print("🔮 NUTRITION5K TEST SET PREDICTION (4 Channels - NO HEIGHT)")
     print("="*70)
     print(f"Model:  {MODEL_PATH}")
     print(f"Output: {OUTPUT_FILE}")
+    print(f"Config: RGB + Depth only (NO HEIGHT)")
     print("="*70)
     
     # Check if model exists
@@ -270,6 +272,7 @@ def main():
         print("2. Click 'Submit Predictions' button")
         print(f"3. Upload {OUTPUT_FILE}")
         print("4. Check your score on the leaderboard!")
+        print("5. Compare with your 5-channel model results!")
         print("="*70)
         
         print("\n✅ Prediction complete!")
